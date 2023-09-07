@@ -56,6 +56,112 @@
 // #include "dtld-abi.h"
 #include "dtld.h"
 
+static const struct verbs_context_ops dtld_ctx_ops = {
+	.query_device_ex = dtld_query_device,
+	.query_port = dtld_query_port,
+	// .alloc_pd = dtld_alloc_pd,
+	// .dealloc_pd = dtld_dealloc_pd,
+	// .reg_mr = dtld_reg_mr,
+	// .dereg_mr = dtld_dereg_mr,
+	// .alloc_mw = dtld_alloc_mw,
+	// .dealloc_mw = dtld_dealloc_mw,
+	// .bind_mw = dtld_bind_mw,
+	// .create_cq = dtld_create_cq,
+	// .create_cq_ex = dtld_create_cq_ex,
+	// .poll_cq = dtld_poll_cq,
+	.req_notify_cq = ibv_cmd_req_notify_cq,
+	// .resize_cq = dtld_resize_cq,
+	// .destroy_cq = dtld_destroy_cq,
+	// .create_srq = dtld_create_srq,
+	// .create_srq_ex = dtld_create_srq_ex,
+	// .modify_srq = dtld_modify_srq,
+	// .query_srq = dtld_query_srq,
+	// .destroy_srq = dtld_destroy_srq,
+	// .post_srq_recv = dtld_post_srq_recv,
+	// .create_qp = dtld_create_qp,
+	// .create_qp_ex = dtld_create_qp_ex,
+	// .query_qp = dtld_query_qp,
+	// .modify_qp = dtld_modify_qp,
+	// .destroy_qp = dtld_destroy_qp,
+	// .post_send = dtld_post_send,
+	// .post_recv = dtld_post_recv,
+	// .create_ah = dtld_create_ah,
+	// .destroy_ah = dtld_destroy_ah,
+	.attach_mcast = ibv_cmd_attach_mcast,
+	.detach_mcast = ibv_cmd_detach_mcast,
+	.free_context = dtld_free_context,
+};
+
+static const struct verbs_device_ops dtld_dev_ops = {
+	.name = "dtld",
+	/*
+	 * For 64 bit machines ABI version 1 and 2 are the same. Otherwise 32
+	 * bit machines require ABI version 2 which guarentees the user and
+	 * kernel use the same ABI.
+	 */
+	.match_min_abi_version = sizeof(void *) == 8?1:2,
+	.match_max_abi_version = 2,
+	.match_table = hca_table,
+	.alloc_device = dtld_device_alloc,
+	.uninit_device = dtld_uninit_device,
+	.alloc_context = dtld_alloc_context,
+};
+
+static struct verbs_context *dtld_alloc_context(struct ibv_device *ibdev,
+					       int cmd_fd,
+					       void *private_data)
+{
+	struct dtld_context *context;
+	struct ibv_get_context cmd;
+	struct ib_uverbs_get_context_resp resp;
+
+	context = verbs_init_and_alloc_context(ibdev, cmd_fd, context, ibv_ctx,
+					       RDMA_DRIVER_DTLD);
+	if (!context)
+		return NULL;
+
+	if (ibv_cmd_get_context(&context->ibv_ctx, &cmd, sizeof(cmd),
+				&resp, sizeof(resp)))
+		goto out;
+
+	verbs_set_ops(&context->ibv_ctx, &dtld_ctx_ops);
+
+	return &context->ibv_ctx;
+
+out:
+	verbs_uninit_context(&context->ibv_ctx);
+	free(context);
+	return NULL;
+}
+
+static void dtld_free_context(struct ibv_context *ibctx)
+{
+	struct dtld_context *context = to_rctx(ibctx);
+
+	verbs_uninit_context(&context->ibv_ctx);
+	free(context);
+}
+
+static void dtld_uninit_device(struct verbs_device *verbs_device)
+{
+	struct dtld_device *dev = to_rdev(&verbs_device->device);
+
+	free(dev);
+}
+
+static struct verbs_device *dtld_device_alloc(struct verbs_sysfs_dev *sysfs_dev)
+{
+	struct dtld_device *dev;
+
+	dev = calloc(1, sizeof(*dev));
+	if (!dev)
+		return NULL;
+
+	dev->abi_version = sysfs_dev->abi_ver;
+
+	return &dev->ibv_dev;
+}
+
 static void dtld_free_context(struct ibv_context *ibctx);
 
 static const struct verbs_match_ent hca_table[] = {
@@ -64,39 +170,39 @@ static const struct verbs_match_ent hca_table[] = {
 	{},
 };
 
-// static int dtld_query_device(struct ibv_context *context,
-// 			    const struct ibv_query_device_ex_input *input,
-// 			    struct ibv_device_attr_ex *attr, size_t attr_size)
-// {
-// 	struct ib_uverbs_ex_query_device_resp resp;
-// 	size_t resp_size = sizeof(resp);
-// 	uint64_t raw_fw_ver;
-// 	unsigned int major, minor, sub_minor;
-// 	int ret;
+static int dtld_query_device(struct ibv_context *context,
+			    const struct ibv_query_device_ex_input *input,
+			    struct ibv_device_attr_ex *attr, size_t attr_size)
+{
+	struct ib_uverbs_ex_query_device_resp resp;
+	size_t resp_size = sizeof(resp);
+	uint64_t raw_fw_ver;
+	unsigned int major, minor, sub_minor;
+	int ret;
 
-// 	ret = ibv_cmd_query_device_any(context, input, attr, attr_size, &resp,
-// 				       &resp_size);
-// 	if (ret)
-// 		return ret;
+	ret = ibv_cmd_query_device_any(context, input, attr, attr_size, &resp,
+				       &resp_size);
+	if (ret)
+		return ret;
 
-// 	raw_fw_ver = resp.base.fw_ver;
-// 	major = (raw_fw_ver >> 32) & 0xffff;
-// 	minor = (raw_fw_ver >> 16) & 0xffff;
-// 	sub_minor = raw_fw_ver & 0xffff;
+	raw_fw_ver = resp.base.fw_ver;
+	major = (raw_fw_ver >> 32) & 0xffff;
+	minor = (raw_fw_ver >> 16) & 0xffff;
+	sub_minor = raw_fw_ver & 0xffff;
 
-// 	snprintf(attr->orig_attr.fw_ver, sizeof(attr->orig_attr.fw_ver),
-// 		 "%d.%d.%d", major, minor, sub_minor);
+	snprintf(attr->orig_attr.fw_ver, sizeof(attr->orig_attr.fw_ver),
+		 "%d.%d.%d", major, minor, sub_minor);
 
-// 	return 0;
-// }
+	return 0;
+}
 
-// static int dtld_query_port(struct ibv_context *context, uint8_t port,
-// 			  struct ibv_port_attr *attr)
-// {
-// 	struct ibv_query_port cmd;
+static int dtld_query_port(struct ibv_context *context, uint8_t port,
+			  struct ibv_port_attr *attr)
+{
+	struct ibv_query_port cmd;
 
-// 	return ibv_cmd_query_port(context, port, attr, &cmd, sizeof(cmd));
-// }
+	return ibv_cmd_query_port(context, port, attr, &cmd, sizeof(cmd));
+}
 
 // static struct ibv_pd *dtld_alloc_pd(struct ibv_context *context)
 // {
@@ -1817,109 +1923,4 @@ static const struct verbs_match_ent hca_table[] = {
 // 	return ret;
 // }
 
-static const struct verbs_context_ops dtld_ctx_ops = {
-	// .query_device_ex = dtld_query_device,
-	// .query_port = dtld_query_port,
-	// .alloc_pd = dtld_alloc_pd,
-	// .dealloc_pd = dtld_dealloc_pd,
-	// .reg_mr = dtld_reg_mr,
-	// .dereg_mr = dtld_dereg_mr,
-	// .alloc_mw = dtld_alloc_mw,
-	// .dealloc_mw = dtld_dealloc_mw,
-	// .bind_mw = dtld_bind_mw,
-	// .create_cq = dtld_create_cq,
-	// .create_cq_ex = dtld_create_cq_ex,
-	// .poll_cq = dtld_poll_cq,
-	.req_notify_cq = ibv_cmd_req_notify_cq,
-	// .resize_cq = dtld_resize_cq,
-	// .destroy_cq = dtld_destroy_cq,
-	// .create_srq = dtld_create_srq,
-	// .create_srq_ex = dtld_create_srq_ex,
-	// .modify_srq = dtld_modify_srq,
-	// .query_srq = dtld_query_srq,
-	// .destroy_srq = dtld_destroy_srq,
-	// .post_srq_recv = dtld_post_srq_recv,
-	// .create_qp = dtld_create_qp,
-	// .create_qp_ex = dtld_create_qp_ex,
-	// .query_qp = dtld_query_qp,
-	// .modify_qp = dtld_modify_qp,
-	// .destroy_qp = dtld_destroy_qp,
-	// .post_send = dtld_post_send,
-	// .post_recv = dtld_post_recv,
-	// .create_ah = dtld_create_ah,
-	// .destroy_ah = dtld_destroy_ah,
-	.attach_mcast = ibv_cmd_attach_mcast,
-	.detach_mcast = ibv_cmd_detach_mcast,
-	.free_context = dtld_free_context,
-};
-
-static struct verbs_context *dtld_alloc_context(struct ibv_device *ibdev,
-					       int cmd_fd,
-					       void *private_data)
-{
-	struct dtld_context *context;
-	struct ibv_get_context cmd;
-	struct ib_uverbs_get_context_resp resp;
-
-	context = verbs_init_and_alloc_context(ibdev, cmd_fd, context, ibv_ctx,
-					       RDMA_DRIVER_DTLD);
-	if (!context)
-		return NULL;
-
-	if (ibv_cmd_get_context(&context->ibv_ctx, &cmd, sizeof(cmd),
-				&resp, sizeof(resp)))
-		goto out;
-
-	verbs_set_ops(&context->ibv_ctx, &dtld_ctx_ops);
-
-	return &context->ibv_ctx;
-
-out:
-	verbs_uninit_context(&context->ibv_ctx);
-	free(context);
-	return NULL;
-}
-
-static void dtld_free_context(struct ibv_context *ibctx)
-{
-	struct dtld_context *context = to_rctx(ibctx);
-
-	verbs_uninit_context(&context->ibv_ctx);
-	free(context);
-}
-
-static void dtld_uninit_device(struct verbs_device *verbs_device)
-{
-	struct dtld_device *dev = to_rdev(&verbs_device->device);
-
-	free(dev);
-}
-
-static struct verbs_device *dtld_device_alloc(struct verbs_sysfs_dev *sysfs_dev)
-{
-	struct dtld_device *dev;
-
-	dev = calloc(1, sizeof(*dev));
-	if (!dev)
-		return NULL;
-
-	dev->abi_version = sysfs_dev->abi_ver;
-
-	return &dev->ibv_dev;
-}
-
-static const struct verbs_device_ops dtld_dev_ops = {
-	.name = "dtld",
-	/*
-	 * For 64 bit machines ABI version 1 and 2 are the same. Otherwise 32
-	 * bit machines require ABI version 2 which guarentees the user and
-	 * kernel use the same ABI.
-	 */
-	.match_min_abi_version = sizeof(void *) == 8?1:2,
-	.match_max_abi_version = 2,
-	.match_table = hca_table,
-	.alloc_device = dtld_device_alloc,
-	.uninit_device = dtld_uninit_device,
-	.alloc_context = dtld_alloc_context,
-};
 PROVIDER_DRIVER(dtld, dtld_dev_ops);
