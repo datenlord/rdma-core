@@ -39,8 +39,8 @@
 #include <infiniband/driver.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-// #include <rdma/rdma_user_dtld.h>
-// #include "dtld-abi.h"
+#include <rdma/rdma_user_dtld.h>
+#include "dtld-abi.h"
 
 struct dtld_device {
 	struct verbs_device	ibv_dev;
@@ -51,43 +51,43 @@ struct dtld_context {
 	struct verbs_context	ibv_ctx;
 };
 
-// /* common between cq and cq_ex */
-// struct dtld_cq {
-// 	struct verbs_cq		vcq;
-// 	struct mminfo		mmap_info;
-// 	struct dtld_queue_buf	*queue;
-// 	pthread_spinlock_t	lock;
+/* common between cq and cq_ex */
+struct dtld_cq {
+	struct verbs_cq		vcq;
+	struct mminfo		mmap_info;
+	struct dtld_queue_buf	*queue;
+	pthread_spinlock_t	lock;
 
-// 	/* new API support */
-// 	struct ib_uverbs_wc	*wc;
-// 	size_t			wc_size;
-// 	uint32_t		cur_index;
-// };
+	/* new API support */
+	struct ib_uverbs_wc	*wc;
+	size_t			wc_size;
+	uint32_t		cur_index;
+};
 
-// struct dtld_ah {
-// 	struct ibv_ah		ibv_ah;
-// 	struct dtld_av		av;
-// 	int			ah_num;
-// };
+struct dtld_ah {
+	struct ibv_ah		ibv_ah;
+	struct dtld_av		av;
+	int			ah_num;
+};
 
-// struct dtld_wq {
-// 	struct dtld_queue_buf	*queue;
-// 	pthread_spinlock_t	lock;
-// 	unsigned int		max_sge;
-// 	unsigned int		max_inline;
-// };
+struct dtld_wq {
+	struct dtld_queue_buf	*queue;
+	pthread_spinlock_t	lock;
+	unsigned int		max_sge;
+	unsigned int		max_inline;
+};
 
-// struct dtld_qp {
-// 	struct verbs_qp		vqp;
-// 	struct mminfo		rq_mmap_info;
-// 	struct dtld_wq		rq;
-// 	struct mminfo		sq_mmap_info;
-// 	struct dtld_wq		sq;
+struct dtld_qp {
+	struct verbs_qp		vqp;
+	struct mminfo		rq_mmap_info;
+	struct dtld_wq		rq;
+	struct mminfo		sq_mmap_info;
+	struct dtld_wq		sq;
 
-// 	/* new API support */
-// 	uint32_t		cur_index;
-// 	int			err;
-// };
+	/* new API support */
+	uint32_t		cur_index;
+	int			err;
+};
 
 // struct dtld_srq {
 // 	struct verbs_srq	vsrq;
@@ -108,15 +108,15 @@ static inline struct dtld_device *to_rdev(struct ibv_device *ibdev)
 	return container_of(ibdev, struct dtld_device, ibv_dev.device);
 }
 
-// static inline struct dtld_cq *to_rcq(struct ibv_cq *ibcq)
-// {
-// 	return container_of(ibcq, struct dtld_cq, vcq.cq);
-// }
+static inline struct dtld_cq *to_rcq(struct ibv_cq *ibcq)
+{
+	return container_of(ibcq, struct dtld_cq, vcq.cq);
+}
 
-// static inline struct dtld_qp *to_rqp(struct ibv_qp *ibqp)
-// {
-// 	return container_of(ibqp, struct dtld_qp, vqp.qp);
-// }
+static inline struct dtld_qp *to_rqp(struct ibv_qp *ibqp)
+{
+	return container_of(ibqp, struct dtld_qp, vqp.qp);
+}
 
 // static inline struct dtld_srq *to_rsrq(struct ibv_srq *ibsrq)
 // {

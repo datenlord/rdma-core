@@ -56,33 +56,271 @@
 // #include "dtld-abi.h"
 #include "dtld.h"
 
+static void dtld_free_context(struct ibv_context *ibctx);
+
+static const struct verbs_match_ent hca_table[] = {
+	VERBS_DRIVER_ID(RDMA_DRIVER_DTLD),
+	VERBS_NAME_MATCH("dtld", NULL),
+	{},
+};
+
+static int dtld_query_device(struct ibv_context *context,
+			    const struct ibv_query_device_ex_input *input,
+			    struct ibv_device_attr_ex *attr, size_t attr_size)
+{
+	struct ib_uverbs_ex_query_device_resp resp;
+	size_t resp_size = sizeof(resp);
+	uint64_t raw_fw_ver;
+	unsigned int major, minor, sub_minor;
+	int ret;
+
+	ret = ibv_cmd_query_device_any(context, input, attr, attr_size, &resp,
+				       &resp_size);
+	if (ret)
+		return ret;
+
+	raw_fw_ver = resp.base.fw_ver;
+	major = (raw_fw_ver >> 32) & 0xffff;
+	minor = (raw_fw_ver >> 16) & 0xffff;
+	sub_minor = raw_fw_ver & 0xffff;
+
+	snprintf(attr->orig_attr.fw_ver, sizeof(attr->orig_attr.fw_ver),
+		 "%d.%d.%d", major, minor, sub_minor);
+
+	return 0;
+}
+
+static int dtld_query_port(struct ibv_context *context, uint8_t port,
+			  struct ibv_port_attr *attr)
+{
+	struct ibv_query_port cmd;
+
+	return ibv_cmd_query_port(context, port, attr, &cmd, sizeof(cmd));
+}
+
+static struct ibv_pd *dtld_alloc_pd(struct ibv_context *context)
+{
+	struct ibv_alloc_pd cmd;
+	struct ib_uverbs_alloc_pd_resp resp;
+	struct ibv_pd *pd;
+
+	pd = calloc(1, sizeof(*pd));
+	if (!pd)
+		return NULL;
+
+	if (ibv_cmd_alloc_pd(context, pd, &cmd, sizeof(cmd),
+					&resp, sizeof(resp))) {
+		free(pd);
+		return NULL;
+	}
+
+	return pd;
+}
+
+static int dtld_dealloc_pd(struct ibv_pd *pd)
+{
+	int ret;
+
+	ret = ibv_cmd_dealloc_pd(pd);
+	if (!ret)
+		free(pd);
+
+	return ret;
+}
+
+static int dtld_destroy_cq(struct ibv_cq *ibcq);
+
+static struct ibv_cq *dtld_create_cq(struct ibv_context *context, int cqe,
+				    struct ibv_comp_channel *channel,
+				    int comp_vector)
+{
+	struct dtld_cq *cq;
+	struct udtld_create_cq_resp resp = {};
+	int ret;
+
+	cq = calloc(1, sizeof(*cq));
+	if (!cq)
+		return NULL;
+
+	ret = ibv_cmd_create_cq(context, cqe, channel, comp_vector,
+				&cq->vcq.cq, NULL, 0,
+				&resp.ibv_resp, sizeof(resp));
+	if (ret) {
+		free(cq);
+		return NULL;
+	}
+
+	cq->queue = mmap(NULL, resp.mi.size, PROT_READ | PROT_WRITE, MAP_SHARED,
+			 context->cmd_fd, resp.mi.offset);
+	if ((void *)cq->queue == MAP_FAILED) {
+		ibv_cmd_destroy_cq(&cq->vcq.cq);
+		free(cq);
+		return NULL;
+	}
+
+	cq->wc_size = 1ULL << cq->queue->log2_elem_size;
+
+	if (cq->wc_size < sizeof(struct ib_uverbs_wc)) {
+		dtld_destroy_cq(&cq->vcq.cq);
+		return NULL;
+	}
+
+	cq->mmap_info = resp.mi;
+	pthread_spin_init(&cq->lock, PTHREAD_PROCESS_PRIVATE);
+
+	return &cq->vcq.cq;
+}
+
+static int dtld_destroy_cq(struct ibv_cq *ibcq)
+{
+	struct dtld_cq *cq = to_rcq(ibcq);
+	int ret;
+
+	ret = ibv_cmd_destroy_cq(ibcq);
+	if (ret)
+		return ret;
+
+	if (cq->mmap_info.size)
+		munmap(cq->queue, cq->mmap_info.size);
+	free(cq);
+
+	return 0;
+}
+
+static int map_queue_pair(int cmd_fd, struct dtld_qp *qp,
+			  struct ibv_qp_init_attr *attr,
+			  struct dtld_create_qp_resp *resp)
+{
+	if (attr->srq) {
+		qp->rq.max_sge = 0;
+		qp->rq.queue = NULL;
+		qp->rq_mmap_info.size = 0;
+	} else {
+		qp->rq.max_sge = attr->cap.max_recv_sge;
+		qp->rq.queue = mmap(NULL, resp->rq_mi.size, PROT_READ | PROT_WRITE,
+				    MAP_SHARED,
+				    cmd_fd, resp->rq_mi.offset);
+		if ((void *)qp->rq.queue == MAP_FAILED)
+			return errno;
+
+		qp->rq_mmap_info = resp->rq_mi;
+		pthread_spin_init(&qp->rq.lock, PTHREAD_PROCESS_PRIVATE);
+	}
+
+	qp->sq.max_sge = attr->cap.max_send_sge;
+	qp->sq.max_inline = attr->cap.max_inline_data;
+	qp->sq.queue = mmap(NULL, resp->sq_mi.size, PROT_READ | PROT_WRITE,
+			    MAP_SHARED,
+			    cmd_fd, resp->sq_mi.offset);
+	if ((void *)qp->sq.queue == MAP_FAILED) {
+		if (qp->rq_mmap_info.size)
+			munmap(qp->rq.queue, qp->rq_mmap_info.size);
+		return errno;
+	}
+
+	qp->sq_mmap_info = resp->sq_mi;
+	pthread_spin_init(&qp->sq.lock, PTHREAD_PROCESS_PRIVATE);
+
+	return 0;
+}
+
+static struct ibv_qp *dtld_create_qp(struct ibv_pd *ibpd,
+				    struct ibv_qp_init_attr *attr)
+{
+	struct ibv_create_qp cmd = {};
+	struct udtld_create_qp_resp resp = {};
+	struct dtld_qp *qp;
+	int ret;
+
+	qp = calloc(1, sizeof(*qp));
+	if (!qp)
+		goto err;
+
+	ret = ibv_cmd_create_qp(ibpd, &qp->vqp.qp, attr, &cmd, sizeof(cmd),
+				&resp.ibv_resp, sizeof(resp));
+	if (ret)
+		goto err_free;
+
+	ret = map_queue_pair(ibpd->context->cmd_fd, qp, attr,
+			     &resp.drv_payload);
+	if (ret)
+		goto err_destroy;
+
+	qp->sq_mmap_info = resp.sq_mi;
+	pthread_spin_init(&qp->sq.lock, PTHREAD_PROCESS_PRIVATE);
+
+	return &qp->vqp.qp;
+
+err_destroy:
+	ibv_cmd_destroy_qp(&qp->vqp.qp);
+err_free:
+	free(qp);
+err:
+	return NULL;
+}
+
+static int dtld_query_qp(struct ibv_qp *ibqp, struct ibv_qp_attr *attr,
+			int attr_mask, struct ibv_qp_init_attr *init_attr)
+{
+	struct ibv_query_qp cmd = {};
+
+	return ibv_cmd_query_qp(ibqp, attr, attr_mask, init_attr,
+				&cmd, sizeof(cmd));
+}
+
+static int dtld_modify_qp(struct ibv_qp *ibqp, struct ibv_qp_attr *attr,
+		  int attr_mask)
+{
+	struct ibv_modify_qp cmd = {};
+
+	return ibv_cmd_modify_qp(ibqp, attr, attr_mask, &cmd, sizeof(cmd));
+}
+
+static int dtld_destroy_qp(struct ibv_qp *ibqp)
+{
+	int ret;
+	struct dtld_qp *qp = to_rqp(ibqp);
+
+	ret = ibv_cmd_destroy_qp(ibqp);
+	if (!ret) {
+		if (qp->rq_mmap_info.size)
+			munmap(qp->rq.queue, qp->rq_mmap_info.size);
+		if (qp->sq_mmap_info.size)
+			munmap(qp->sq.queue, qp->sq_mmap_info.size);
+
+		free(qp);
+	}
+
+	return ret;
+}
+
 static const struct verbs_context_ops dtld_ctx_ops = {
 	.query_device_ex = dtld_query_device,
 	.query_port = dtld_query_port,
-	// .alloc_pd = dtld_alloc_pd,
-	// .dealloc_pd = dtld_dealloc_pd,
+	.alloc_pd = dtld_alloc_pd,
+	.dealloc_pd = dtld_dealloc_pd,
 	// .reg_mr = dtld_reg_mr,
 	// .dereg_mr = dtld_dereg_mr,
 	// .alloc_mw = dtld_alloc_mw,
 	// .dealloc_mw = dtld_dealloc_mw,
 	// .bind_mw = dtld_bind_mw,
-	// .create_cq = dtld_create_cq,
+	.create_cq = dtld_create_cq,
 	// .create_cq_ex = dtld_create_cq_ex,
 	// .poll_cq = dtld_poll_cq,
 	.req_notify_cq = ibv_cmd_req_notify_cq,
 	// .resize_cq = dtld_resize_cq,
-	// .destroy_cq = dtld_destroy_cq,
+	.destroy_cq = dtld_destroy_cq,
 	// .create_srq = dtld_create_srq,
 	// .create_srq_ex = dtld_create_srq_ex,
 	// .modify_srq = dtld_modify_srq,
 	// .query_srq = dtld_query_srq,
 	// .destroy_srq = dtld_destroy_srq,
 	// .post_srq_recv = dtld_post_srq_recv,
-	// .create_qp = dtld_create_qp,
+	.create_qp = dtld_create_qp,
 	// .create_qp_ex = dtld_create_qp_ex,
-	// .query_qp = dtld_query_qp,
-	// .modify_qp = dtld_modify_qp,
-	// .destroy_qp = dtld_destroy_qp,
+	.query_qp = dtld_query_qp,
+	.modify_qp = dtld_modify_qp,
+	.destroy_qp = dtld_destroy_qp,
 	// .post_send = dtld_post_send,
 	// .post_recv = dtld_post_recv,
 	// .create_ah = dtld_create_ah,
@@ -90,21 +328,6 @@ static const struct verbs_context_ops dtld_ctx_ops = {
 	.attach_mcast = ibv_cmd_attach_mcast,
 	.detach_mcast = ibv_cmd_detach_mcast,
 	.free_context = dtld_free_context,
-};
-
-static const struct verbs_device_ops dtld_dev_ops = {
-	.name = "dtld",
-	/*
-	 * For 64 bit machines ABI version 1 and 2 are the same. Otherwise 32
-	 * bit machines require ABI version 2 which guarentees the user and
-	 * kernel use the same ABI.
-	 */
-	.match_min_abi_version = sizeof(void *) == 8?1:2,
-	.match_max_abi_version = 2,
-	.match_table = hca_table,
-	.alloc_device = dtld_device_alloc,
-	.uninit_device = dtld_uninit_device,
-	.alloc_context = dtld_alloc_context,
 };
 
 static struct verbs_context *dtld_alloc_context(struct ibv_device *ibdev,
@@ -162,77 +385,22 @@ static struct verbs_device *dtld_device_alloc(struct verbs_sysfs_dev *sysfs_dev)
 	return &dev->ibv_dev;
 }
 
-static void dtld_free_context(struct ibv_context *ibctx);
-
-static const struct verbs_match_ent hca_table[] = {
-	VERBS_DRIVER_ID(RDMA_DRIVER_DTLD),
-	VERBS_NAME_MATCH("dtld", NULL),
-	{},
+static const struct verbs_device_ops dtld_dev_ops = {
+	.name = "dtld",
+	/*
+	 * For 64 bit machines ABI version 1 and 2 are the same. Otherwise 32
+	 * bit machines require ABI version 2 which guarentees the user and
+	 * kernel use the same ABI.
+	 */
+	.match_min_abi_version = sizeof(void *) == 8?1:2,
+	.match_max_abi_version = 2,
+	.match_table = hca_table,
+	.alloc_device = dtld_device_alloc,
+	.uninit_device = dtld_uninit_device,
+	.alloc_context = dtld_alloc_context,
 };
 
-static int dtld_query_device(struct ibv_context *context,
-			    const struct ibv_query_device_ex_input *input,
-			    struct ibv_device_attr_ex *attr, size_t attr_size)
-{
-	struct ib_uverbs_ex_query_device_resp resp;
-	size_t resp_size = sizeof(resp);
-	uint64_t raw_fw_ver;
-	unsigned int major, minor, sub_minor;
-	int ret;
-
-	ret = ibv_cmd_query_device_any(context, input, attr, attr_size, &resp,
-				       &resp_size);
-	if (ret)
-		return ret;
-
-	raw_fw_ver = resp.base.fw_ver;
-	major = (raw_fw_ver >> 32) & 0xffff;
-	minor = (raw_fw_ver >> 16) & 0xffff;
-	sub_minor = raw_fw_ver & 0xffff;
-
-	snprintf(attr->orig_attr.fw_ver, sizeof(attr->orig_attr.fw_ver),
-		 "%d.%d.%d", major, minor, sub_minor);
-
-	return 0;
-}
-
-static int dtld_query_port(struct ibv_context *context, uint8_t port,
-			  struct ibv_port_attr *attr)
-{
-	struct ibv_query_port cmd;
-
-	return ibv_cmd_query_port(context, port, attr, &cmd, sizeof(cmd));
-}
-
-// static struct ibv_pd *dtld_alloc_pd(struct ibv_context *context)
-// {
-// 	struct ibv_alloc_pd cmd;
-// 	struct ib_uverbs_alloc_pd_resp resp;
-// 	struct ibv_pd *pd;
-
-// 	pd = calloc(1, sizeof(*pd));
-// 	if (!pd)
-// 		return NULL;
-
-// 	if (ibv_cmd_alloc_pd(context, pd, &cmd, sizeof(cmd),
-// 					&resp, sizeof(resp))) {
-// 		free(pd);
-// 		return NULL;
-// 	}
-
-// 	return pd;
-// }
-
-// static int dtld_dealloc_pd(struct ibv_pd *pd)
-// {
-// 	int ret;
-
-// 	ret = ibv_cmd_dealloc_pd(pd);
-// 	if (!ret)
-// 		free(pd);
-
-// 	return ret;
-// }
+PROVIDER_DRIVER(dtld, dtld_dev_ops);
 
 // static struct ibv_mw *dtld_alloc_mw(struct ibv_pd *ibpd, enum ibv_mw_type type)
 // {
@@ -466,49 +634,6 @@ static int dtld_query_port(struct ibv_context *context, uint8_t port,
 // 	return cq->wc->dlid_path_bits;
 // }
 
-// static int dtld_destroy_cq(struct ibv_cq *ibcq);
-
-// static struct ibv_cq *dtld_create_cq(struct ibv_context *context, int cqe,
-// 				    struct ibv_comp_channel *channel,
-// 				    int comp_vector)
-// {
-// 	struct dtld_cq *cq;
-// 	struct udtld_create_cq_resp resp = {};
-// 	int ret;
-
-// 	cq = calloc(1, sizeof(*cq));
-// 	if (!cq)
-// 		return NULL;
-
-// 	ret = ibv_cmd_create_cq(context, cqe, channel, comp_vector,
-// 				&cq->vcq.cq, NULL, 0,
-// 				&resp.ibv_resp, sizeof(resp));
-// 	if (ret) {
-// 		free(cq);
-// 		return NULL;
-// 	}
-
-// 	cq->queue = mmap(NULL, resp.mi.size, PROT_READ | PROT_WRITE, MAP_SHARED,
-// 			 context->cmd_fd, resp.mi.offset);
-// 	if ((void *)cq->queue == MAP_FAILED) {
-// 		ibv_cmd_destroy_cq(&cq->vcq.cq);
-// 		free(cq);
-// 		return NULL;
-// 	}
-
-// 	cq->wc_size = 1ULL << cq->queue->log2_elem_size;
-
-// 	if (cq->wc_size < sizeof(struct ib_uverbs_wc)) {
-// 		dtld_destroy_cq(&cq->vcq.cq);
-// 		return NULL;
-// 	}
-
-// 	cq->mmap_info = resp.mi;
-// 	pthread_spin_init(&cq->lock, PTHREAD_PROCESS_PRIVATE);
-
-// 	return &cq->vcq.cq;
-// }
-
 // enum dtld_sup_wc_flags {
 // 	DTLD_SUP_WC_FLAGS	= IBV_WC_EX_WITH_BYTE_LEN
 // 				| IBV_WC_EX_WITH_IMM
@@ -637,22 +762,6 @@ static int dtld_query_port(struct ibv_context *context, uint8_t port,
 // 	}
 
 // 	cq->mmap_info = resp.mi;
-
-// 	return 0;
-// }
-
-// static int dtld_destroy_cq(struct ibv_cq *ibcq)
-// {
-// 	struct dtld_cq *cq = to_rcq(ibcq);
-// 	int ret;
-
-// 	ret = ibv_cmd_destroy_cq(ibcq);
-// 	if (ret)
-// 		return ret;
-
-// 	if (cq->mmap_info.size)
-// 		munmap(cq->queue, cq->mmap_info.size);
-// 	free(cq);
 
 // 	return 0;
 // }
@@ -1266,7 +1375,6 @@ static int dtld_query_port(struct ibv_context *context, uint8_t port,
 // 	wqe->dma.resid = tot_length;
 // }
 
-
 // static void wr_start(struct ibv_qp_ex *ibqp)
 // {
 // 	struct dtld_qp *qp = container_of(ibqp, struct dtld_qp, vqp.qp_ex);
@@ -1301,78 +1409,6 @@ static int dtld_query_port(struct ibv_context *context, uint8_t port,
 // 	struct dtld_qp *qp = container_of(ibqp, struct dtld_qp, vqp.qp_ex);
 
 // 	pthread_spin_unlock(&qp->sq.lock);
-// }
-
-// static int map_queue_pair(int cmd_fd, struct dtld_qp *qp,
-// 			  struct ibv_qp_init_attr *attr,
-// 			  struct dtld_create_qp_resp *resp)
-// {
-// 	if (attr->srq) {
-// 		qp->rq.max_sge = 0;
-// 		qp->rq.queue = NULL;
-// 		qp->rq_mmap_info.size = 0;
-// 	} else {
-// 		qp->rq.max_sge = attr->cap.max_recv_sge;
-// 		qp->rq.queue = mmap(NULL, resp->rq_mi.size, PROT_READ | PROT_WRITE,
-// 				    MAP_SHARED,
-// 				    cmd_fd, resp->rq_mi.offset);
-// 		if ((void *)qp->rq.queue == MAP_FAILED)
-// 			return errno;
-
-// 		qp->rq_mmap_info = resp->rq_mi;
-// 		pthread_spin_init(&qp->rq.lock, PTHREAD_PROCESS_PRIVATE);
-// 	}
-
-// 	qp->sq.max_sge = attr->cap.max_send_sge;
-// 	qp->sq.max_inline = attr->cap.max_inline_data;
-// 	qp->sq.queue = mmap(NULL, resp->sq_mi.size, PROT_READ | PROT_WRITE,
-// 			    MAP_SHARED,
-// 			    cmd_fd, resp->sq_mi.offset);
-// 	if ((void *)qp->sq.queue == MAP_FAILED) {
-// 		if (qp->rq_mmap_info.size)
-// 			munmap(qp->rq.queue, qp->rq_mmap_info.size);
-// 		return errno;
-// 	}
-
-// 	qp->sq_mmap_info = resp->sq_mi;
-// 	pthread_spin_init(&qp->sq.lock, PTHREAD_PROCESS_PRIVATE);
-
-// 	return 0;
-// }
-
-// static struct ibv_qp *dtld_create_qp(struct ibv_pd *ibpd,
-// 				    struct ibv_qp_init_attr *attr)
-// {
-// 	struct ibv_create_qp cmd = {};
-// 	struct udtld_create_qp_resp resp = {};
-// 	struct dtld_qp *qp;
-// 	int ret;
-
-// 	qp = calloc(1, sizeof(*qp));
-// 	if (!qp)
-// 		goto err;
-
-// 	ret = ibv_cmd_create_qp(ibpd, &qp->vqp.qp, attr, &cmd, sizeof(cmd),
-// 				&resp.ibv_resp, sizeof(resp));
-// 	if (ret)
-// 		goto err_free;
-
-// 	ret = map_queue_pair(ibpd->context->cmd_fd, qp, attr,
-// 			     &resp.drv_payload);
-// 	if (ret)
-// 		goto err_destroy;
-
-// 	qp->sq_mmap_info = resp.sq_mi;
-// 	pthread_spin_init(&qp->sq.lock, PTHREAD_PROCESS_PRIVATE);
-
-// 	return &qp->vqp.qp;
-
-// err_destroy:
-// 	ibv_cmd_destroy_qp(&qp->vqp.qp);
-// err_free:
-// 	free(qp);
-// err:
-// 	return NULL;
 // }
 
 // enum {
@@ -1524,41 +1560,6 @@ static int dtld_query_port(struct ibv_context *context, uint8_t port,
 // 	free(qp);
 // err:
 // 	return NULL;
-// }
-
-// static int dtld_query_qp(struct ibv_qp *ibqp, struct ibv_qp_attr *attr,
-// 			int attr_mask, struct ibv_qp_init_attr *init_attr)
-// {
-// 	struct ibv_query_qp cmd = {};
-
-// 	return ibv_cmd_query_qp(ibqp, attr, attr_mask, init_attr,
-// 				&cmd, sizeof(cmd));
-// }
-
-// static int dtld_modify_qp(struct ibv_qp *ibqp, struct ibv_qp_attr *attr,
-// 		  int attr_mask)
-// {
-// 	struct ibv_modify_qp cmd = {};
-
-// 	return ibv_cmd_modify_qp(ibqp, attr, attr_mask, &cmd, sizeof(cmd));
-// }
-
-// static int dtld_destroy_qp(struct ibv_qp *ibqp)
-// {
-// 	int ret;
-// 	struct dtld_qp *qp = to_rqp(ibqp);
-
-// 	ret = ibv_cmd_destroy_qp(ibqp);
-// 	if (!ret) {
-// 		if (qp->rq_mmap_info.size)
-// 			munmap(qp->rq.queue, qp->rq_mmap_info.size);
-// 		if (qp->sq_mmap_info.size)
-// 			munmap(qp->sq.queue, qp->sq_mmap_info.size);
-
-// 		free(qp);
-// 	}
-
-// 	return ret;
 // }
 
 // /* basic sanity checks for send work request */
@@ -1922,5 +1923,3 @@ static int dtld_query_port(struct ibv_context *context, uint8_t port,
 
 // 	return ret;
 // }
-
-PROVIDER_DRIVER(dtld, dtld_dev_ops);
