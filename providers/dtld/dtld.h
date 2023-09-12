@@ -54,7 +54,7 @@ struct dtld_context {
 /* common between cq and cq_ex */
 struct dtld_cq {
 	struct verbs_cq		vcq;
-	struct mminfo		mmap_info;
+	// struct mminfo		mmap_info;   // TODO delete me
 	struct dtld_queue_buf	*queue;
 	pthread_spinlock_t	lock;
 

@@ -59,7 +59,7 @@
 static void dtld_free_context(struct ibv_context *ibctx);
 
 static const struct verbs_match_ent hca_table[] = {
-	VERBS_DRIVER_ID(RDMA_DRIVER_DTLD),
+	VERBS_DRIVER_ID(RDMA_DRIVER_UNKNOWN),
 	VERBS_NAME_MATCH("dtld", NULL),
 	{},
 };
@@ -135,28 +135,37 @@ static struct ibv_cq *dtld_create_cq(struct ibv_context *context, int cqe,
 				    int comp_vector)
 {
 	struct dtld_cq *cq;
+	struct udtld_create_cq req = {};
+	struct dtld_create_cq_req *req_drv_data;
 	struct udtld_create_cq_resp resp = {};
+	struct dtld_create_cq_resp *resp_drv_data;
 	int ret;
 
 	cq = calloc(1, sizeof(*cq));
 	if (!cq)
 		return NULL;
 
+	req_drv_data = &req.drv_payload;
+	resp_drv_data = &resp.drv_payload;
+
+	req_drv_data->buf_addr = 0xaabbaabb; // TODO magic number as placeholder, fix me
+
 	ret = ibv_cmd_create_cq(context, cqe, channel, comp_vector,
-				&cq->vcq.cq, NULL, 0,
+				&cq->vcq.cq, &req.ibv_cmd, sizeof(req),
 				&resp.ibv_resp, sizeof(resp));
 	if (ret) {
 		free(cq);
 		return NULL;
 	}
 
-	cq->queue = mmap(NULL, resp.mi.size, PROT_READ | PROT_WRITE, MAP_SHARED,
-			 context->cmd_fd, resp.mi.offset);
-	if ((void *)cq->queue == MAP_FAILED) {
-		ibv_cmd_destroy_cq(&cq->vcq.cq);
-		free(cq);
-		return NULL;
-	}
+	// TODO Delete me
+	// cq->queue = mmap(NULL, resp.mi.size, PROT_READ | PROT_WRITE, MAP_SHARED,
+	// 		 context->cmd_fd, resp.mi.offset);
+	// if ((void *)cq->queue == MAP_FAILED) {
+	// 	ibv_cmd_destroy_cq(&cq->vcq.cq);
+	// 	free(cq);
+	// 	return NULL;
+	// }
 
 	cq->wc_size = 1ULL << cq->queue->log2_elem_size;
 
@@ -165,7 +174,7 @@ static struct ibv_cq *dtld_create_cq(struct ibv_context *context, int cqe,
 		return NULL;
 	}
 
-	cq->mmap_info = resp.mi;
+	// cq->mmap_info = resp.mi;   // TODO delete me
 	pthread_spin_init(&cq->lock, PTHREAD_PROCESS_PRIVATE);
 
 	return &cq->vcq.cq;
@@ -180,8 +189,8 @@ static int dtld_destroy_cq(struct ibv_cq *ibcq)
 	if (ret)
 		return ret;
 
-	if (cq->mmap_info.size)
-		munmap(cq->queue, cq->mmap_info.size);
+	// if (cq->mmap_info.size)    // TODO delete me
+	// 	munmap(cq->queue, cq->mmap_info.size);   //TODO deletel me
 	free(cq);
 
 	return 0;
@@ -689,7 +698,7 @@ static struct verbs_context *dtld_alloc_context(struct ibv_device *ibdev,
 	struct ib_uverbs_get_context_resp resp;
 
 	context = verbs_init_and_alloc_context(ibdev, cmd_fd, context, ibv_ctx,
-					       RDMA_DRIVER_DTLD);
+					       RDMA_DRIVER_UNKNOWN);
 	if (!context)
 		return NULL;
 
