@@ -52,8 +52,8 @@
 #include <infiniband/driver.h>
 #include <infiniband/verbs.h>
 
-// #include "dtld_queue.h"
-// #include "dtld-abi.h"
+#include "dtld_queue.h"
+#include "dtld-abi.h"
 #include "dtld.h"
 
 static void dtld_free_context(struct ibv_context *ibctx);
@@ -294,19 +294,369 @@ static int dtld_destroy_qp(struct ibv_qp *ibqp)
 	return ret;
 }
 
+static struct ibv_mr *dtld_reg_mr(struct ibv_pd *pd, void *addr, size_t length,
+				 uint64_t hca_va, int access)
+{
+	struct verbs_mr *vmr;
+	struct ibv_reg_mr cmd;
+	struct ib_uverbs_reg_mr_resp resp;
+	int ret;
+
+	vmr = calloc(1, sizeof(*vmr));
+	if (!vmr)
+		return NULL;
+
+	ret = ibv_cmd_reg_mr(pd, addr, length, hca_va, access, vmr, &cmd,
+			     sizeof(cmd), &resp, sizeof(resp));
+	if (ret) {
+		free(vmr);
+		return NULL;
+	}
+
+	return &vmr->ibv_mr;
+}
+
+static int dtld_poll_cq(struct ibv_cq *ibcq, int ne, struct ibv_wc *wc)
+{
+	struct dtld_cq *cq = to_rcq(ibcq);
+	struct dtld_queue_buf *q;
+	int npolled;
+	uint8_t *src;
+
+	pthread_spin_lock(&cq->lock);
+	q = cq->queue;
+
+	for (npolled = 0; npolled < ne; ++npolled, ++wc) {
+		if (queue_empty(q))
+			break;
+
+		src = consumer_addr(q);
+		memcpy(wc, src, sizeof(*wc));
+		advance_consumer(q);
+	}
+
+	pthread_spin_unlock(&cq->lock);
+	return npolled;
+}
+
+static void convert_send_wr(struct dtld_qp *qp, struct dtld_send_wr *kwr,
+					struct ibv_send_wr *uwr)
+{
+	struct ibv_mw *ibmw;
+	struct ibv_mr *ibmr;
+
+	memset(kwr, 0, sizeof(*kwr));
+
+	kwr->wr_id		= uwr->wr_id;
+	kwr->opcode		= uwr->opcode;
+	kwr->send_flags		= uwr->send_flags;
+	kwr->ex.imm_data	= uwr->imm_data;
+
+	switch (uwr->opcode) {
+	case IBV_WR_RDMA_WRITE:
+	case IBV_WR_RDMA_WRITE_WITH_IMM:
+	case IBV_WR_RDMA_READ:
+		kwr->wr.rdma.remote_addr	= uwr->wr.rdma.remote_addr;
+		kwr->wr.rdma.rkey		= uwr->wr.rdma.rkey;
+		break;
+
+	case IBV_WR_SEND:
+	case IBV_WR_SEND_WITH_IMM:
+		if (qp_type(qp) == IBV_QPT_UD) {
+			struct dtld_ah *ah = to_rah(uwr->wr.ud.ah);
+
+			kwr->wr.ud.remote_qpn	= uwr->wr.ud.remote_qpn;
+			kwr->wr.ud.remote_qkey	= uwr->wr.ud.remote_qkey;
+			kwr->wr.ud.ah_num	= ah->ah_num;
+		}
+		break;
+
+	case IBV_WR_ATOMIC_CMP_AND_SWP:
+	case IBV_WR_ATOMIC_FETCH_AND_ADD:
+		kwr->wr.atomic.remote_addr	= uwr->wr.atomic.remote_addr;
+		kwr->wr.atomic.compare_add	= uwr->wr.atomic.compare_add;
+		kwr->wr.atomic.swap		= uwr->wr.atomic.swap;
+		kwr->wr.atomic.rkey		= uwr->wr.atomic.rkey;
+		break;
+
+	case IBV_WR_BIND_MW:
+		ibmr = uwr->bind_mw.bind_info.mr;
+		ibmw = uwr->bind_mw.mw;
+
+		kwr->wr.mw.addr = uwr->bind_mw.bind_info.addr;
+		kwr->wr.mw.length = uwr->bind_mw.bind_info.length;
+		kwr->wr.mw.mr_lkey = ibmr->lkey;
+		kwr->wr.mw.mw_rkey = ibmw->rkey;
+		kwr->wr.mw.rkey = uwr->bind_mw.rkey;
+		kwr->wr.mw.access = uwr->bind_mw.bind_info.mw_access_flags;
+		break;
+
+	default:
+		break;
+	}
+}
+
+/* basic sanity checks for send work request */
+static int validate_send_wr(struct dtld_qp *qp, struct ibv_send_wr *ibwr,
+			    unsigned int length)
+{
+	struct dtld_wq *sq = &qp->sq;
+	enum ibv_wr_opcode opcode = ibwr->opcode;
+
+	if (ibwr->num_sge > sq->max_sge)
+		return EINVAL;
+
+	if ((opcode == IBV_WR_ATOMIC_CMP_AND_SWP)
+	    || (opcode == IBV_WR_ATOMIC_FETCH_AND_ADD))
+		if (length < 8 || ibwr->wr.atomic.remote_addr & 0x7)
+			return EINVAL;
+
+	if ((ibwr->send_flags & IBV_SEND_INLINE) && (length > sq->max_inline))
+		return EINVAL;
+
+	if (ibwr->opcode == IBV_WR_BIND_MW) {
+		if (length)
+			return EINVAL;
+		if (ibwr->num_sge)
+			return EINVAL;
+		if (ibwr->imm_data)
+			return EINVAL;
+		if ((qp_type(qp) != IBV_QPT_RC) && (qp_type(qp) != IBV_QPT_UC))
+			return EINVAL;
+	}
+
+	return 0;
+}
+
+static int init_send_wqe(struct dtld_qp *qp, struct dtld_wq *sq,
+		  struct ibv_send_wr *ibwr, unsigned int length,
+		  struct dtld_send_wqe *wqe)
+{
+	int num_sge = ibwr->num_sge;
+	int i;
+	unsigned int opcode = ibwr->opcode;
+
+	convert_send_wr(qp, &wqe->wr, ibwr);
+
+	if (qp_type(qp) == IBV_QPT_UD) {
+		struct dtld_ah *ah = to_rah(ibwr->wr.ud.ah);
+
+		if (!ah->ah_num)
+			/* old kernels only */
+			memcpy(&wqe->wr.wr.ud.av, &ah->av, sizeof(struct dtld_av));
+	}
+
+	if (ibwr->send_flags & IBV_SEND_INLINE) {
+		uint8_t *inline_data = wqe->dma.inline_data;
+
+		for (i = 0; i < num_sge; i++) {
+			memcpy(inline_data,
+			       (uint8_t *)(long)ibwr->sg_list[i].addr,
+			       ibwr->sg_list[i].length);
+			inline_data += ibwr->sg_list[i].length;
+		}
+	} else
+		memcpy(wqe->dma.sge, ibwr->sg_list,
+		       num_sge*sizeof(struct ibv_sge));
+
+	if ((opcode == IBV_WR_ATOMIC_CMP_AND_SWP)
+	    || (opcode == IBV_WR_ATOMIC_FETCH_AND_ADD))
+		wqe->iova	= ibwr->wr.atomic.remote_addr;
+	else
+		wqe->iova	= ibwr->wr.rdma.remote_addr;
+
+	wqe->dma.length		= length;
+	wqe->dma.resid		= length;
+	wqe->dma.num_sge	= num_sge;
+	wqe->dma.cur_sge	= 0;
+	wqe->dma.sge_offset	= 0;
+	wqe->state		= 0;
+
+	return 0;
+}
+
+static int post_one_send(struct dtld_qp *qp, struct dtld_wq *sq,
+			 struct ibv_send_wr *ibwr)
+{
+	int err;
+	struct dtld_send_wqe *wqe;
+	unsigned int length = 0;
+	int i;
+
+	for (i = 0; i < ibwr->num_sge; i++)
+		length += ibwr->sg_list[i].length;
+
+	err = validate_send_wr(qp, ibwr, length);
+	if (err) {
+		verbs_err(verbs_get_ctx(qp->vqp.qp.context),
+			  "validate send failed\n");
+		return err;
+	}
+
+	wqe = (struct dtld_send_wqe *)producer_addr(sq->queue);
+
+	err = init_send_wqe(qp, sq, ibwr, length, wqe);
+	if (err)
+		return err;
+
+	if (queue_full(sq->queue))
+		return ENOMEM;
+
+	advance_producer(sq->queue);
+
+	return 0;
+}
+
+/* send a null post send as a doorbell */
+static int post_send_db(struct ibv_qp *ibqp)
+{
+	struct ibv_post_send cmd;
+	struct ib_uverbs_post_send_resp resp;
+
+	cmd.hdr.command	= IB_USER_VERBS_CMD_POST_SEND;
+	cmd.hdr.in_words = sizeof(cmd) / 4;
+	cmd.hdr.out_words = sizeof(resp) / 4;
+	cmd.response	= (uintptr_t)&resp;
+	cmd.qp_handle	= ibqp->handle;
+	cmd.wr_count	= 0;
+	cmd.sge_count	= 0;
+	cmd.wqe_size	= sizeof(struct ibv_send_wr);
+
+	if (write(ibqp->context->cmd_fd, &cmd, sizeof(cmd)) != sizeof(cmd))
+		return errno;
+
+	return 0;
+}
+
+/* this API does not make a distinction between
+ * restartable and non-restartable errors
+ */
+static int dtld_post_send(struct ibv_qp *ibqp,
+			 struct ibv_send_wr *wr_list,
+			 struct ibv_send_wr **bad_wr)
+{
+	int rc = 0;
+	int err;
+	struct dtld_qp *qp = to_rqp(ibqp);
+	struct dtld_wq *sq = &qp->sq;
+
+	if (!bad_wr)
+		return EINVAL;
+
+	*bad_wr = NULL;
+
+	if (!sq || !wr_list || !sq->queue)
+		return EINVAL;
+
+	pthread_spin_lock(&sq->lock);
+
+	while (wr_list) {
+		rc = post_one_send(qp, sq, wr_list);
+		if (rc) {
+			*bad_wr = wr_list;
+			break;
+		}
+
+		wr_list = wr_list->next;
+	}
+
+	pthread_spin_unlock(&sq->lock);
+
+	err =  post_send_db(ibqp);
+	return err ? err : rc;
+}
+
+static int dtld_post_one_recv(struct dtld_wq *rq, struct ibv_recv_wr *recv_wr)
+{
+	int i;
+	struct dtld_recv_wqe *wqe;
+	struct dtld_queue_buf *q = rq->queue;
+	int num_sge = recv_wr->num_sge;
+	int length = 0;
+	int rc = 0;
+
+	if (queue_full(q)) {
+		rc  = ENOMEM;
+		goto out;
+	}
+
+	if (num_sge > rq->max_sge) {
+		rc = EINVAL;
+		goto out;
+	}
+
+	wqe = (struct dtld_recv_wqe *)producer_addr(q);
+
+	wqe->wr_id = recv_wr->wr_id;
+
+	memcpy(wqe->dma.sge, recv_wr->sg_list,
+	       num_sge*sizeof(*wqe->dma.sge));
+
+	for (i = 0; i < num_sge; i++)
+		length += wqe->dma.sge[i].length;
+
+	wqe->dma.length = length;
+	wqe->dma.resid = length;
+	wqe->dma.cur_sge = 0;
+	wqe->dma.num_sge = num_sge;
+	wqe->dma.sge_offset = 0;
+
+	advance_producer(q);
+
+out:
+	return rc;
+}
+
+static int dtld_post_recv(struct ibv_qp *ibqp,
+			 struct ibv_recv_wr *recv_wr,
+			 struct ibv_recv_wr **bad_wr)
+{
+	int rc = 0;
+	struct dtld_qp *qp = to_rqp(ibqp);
+	struct dtld_wq *rq = &qp->rq;
+
+	if (!bad_wr)
+		return EINVAL;
+
+	*bad_wr = NULL;
+
+	if (!rq || !recv_wr || !rq->queue)
+		return EINVAL;
+
+	/* see C10-97.2.1 */
+	if (ibqp->state == IBV_QPS_RESET)
+		return EINVAL;
+
+	pthread_spin_lock(&rq->lock);
+
+	while (recv_wr) {
+		rc = dtld_post_one_recv(rq, recv_wr);
+		if (rc) {
+			*bad_wr = recv_wr;
+			break;
+		}
+
+		recv_wr = recv_wr->next;
+	}
+
+	pthread_spin_unlock(&rq->lock);
+
+	return rc;
+}
+
 static const struct verbs_context_ops dtld_ctx_ops = {
 	.query_device_ex = dtld_query_device,
 	.query_port = dtld_query_port,
 	.alloc_pd = dtld_alloc_pd,
 	.dealloc_pd = dtld_dealloc_pd,
-	// .reg_mr = dtld_reg_mr,
+	.reg_mr = dtld_reg_mr,
 	// .dereg_mr = dtld_dereg_mr,
 	// .alloc_mw = dtld_alloc_mw,
 	// .dealloc_mw = dtld_dealloc_mw,
 	// .bind_mw = dtld_bind_mw,
 	.create_cq = dtld_create_cq,
 	// .create_cq_ex = dtld_create_cq_ex,
-	// .poll_cq = dtld_poll_cq,
+	.poll_cq = dtld_poll_cq,
 	.req_notify_cq = ibv_cmd_req_notify_cq,
 	// .resize_cq = dtld_resize_cq,
 	.destroy_cq = dtld_destroy_cq,
@@ -321,8 +671,8 @@ static const struct verbs_context_ops dtld_ctx_ops = {
 	.query_qp = dtld_query_qp,
 	.modify_qp = dtld_modify_qp,
 	.destroy_qp = dtld_destroy_qp,
-	// .post_send = dtld_post_send,
-	// .post_recv = dtld_post_recv,
+	.post_send = dtld_post_send,
+	.post_recv = dtld_post_recv,
 	// .create_ah = dtld_create_ah,
 	// .destroy_ah = dtld_destroy_ah,
 	.attach_mcast = ibv_cmd_attach_mcast,
@@ -477,28 +827,6 @@ PROVIDER_DRIVER(dtld, dtld_dev_ops);
 // err:
 // 	errno = ret;
 // 	return errno;
-// }
-
-// static struct ibv_mr *dtld_reg_mr(struct ibv_pd *pd, void *addr, size_t length,
-// 				 uint64_t hca_va, int access)
-// {
-// 	struct verbs_mr *vmr;
-// 	struct ibv_reg_mr cmd;
-// 	struct ib_uverbs_reg_mr_resp resp;
-// 	int ret;
-
-// 	vmr = calloc(1, sizeof(*vmr));
-// 	if (!vmr)
-// 		return NULL;
-
-// 	ret = ibv_cmd_reg_mr(pd, addr, length, hca_va, access, vmr, &cmd,
-// 			     sizeof(cmd), &resp, sizeof(resp));
-// 	if (ret) {
-// 		free(vmr);
-// 		return NULL;
-// 	}
-
-// 	return &vmr->ibv_mr;
 // }
 
 // static int dtld_dereg_mr(struct verbs_mr *vmr)
@@ -766,29 +1094,6 @@ PROVIDER_DRIVER(dtld, dtld_dev_ops);
 // 	return 0;
 // }
 
-// static int dtld_poll_cq(struct ibv_cq *ibcq, int ne, struct ibv_wc *wc)
-// {
-// 	struct dtld_cq *cq = to_rcq(ibcq);
-// 	struct dtld_queue_buf *q;
-// 	int npolled;
-// 	uint8_t *src;
-
-// 	pthread_spin_lock(&cq->lock);
-// 	q = cq->queue;
-
-// 	for (npolled = 0; npolled < ne; ++npolled, ++wc) {
-// 		if (queue_empty(q))
-// 			break;
-
-// 		src = consumer_addr(q);
-// 		memcpy(wc, src, sizeof(*wc));
-// 		advance_consumer(q);
-// 	}
-
-// 	pthread_spin_unlock(&cq->lock);
-// 	return npolled;
-// }
-
 // static struct ibv_srq *dtld_create_srq(struct ibv_pd *ibpd,
 // 				      struct ibv_srq_init_attr *attr)
 // {
@@ -929,47 +1234,6 @@ PROVIDER_DRIVER(dtld, dtld_dev_ops);
 // 	}
 
 // 	return ret;
-// }
-
-// static int dtld_post_one_recv(struct dtld_wq *rq, struct ibv_recv_wr *recv_wr)
-// {
-// 	int i;
-// 	struct dtld_recv_wqe *wqe;
-// 	struct dtld_queue_buf *q = rq->queue;
-// 	int num_sge = recv_wr->num_sge;
-// 	int length = 0;
-// 	int rc = 0;
-
-// 	if (queue_full(q)) {
-// 		rc  = ENOMEM;
-// 		goto out;
-// 	}
-
-// 	if (num_sge > rq->max_sge) {
-// 		rc = EINVAL;
-// 		goto out;
-// 	}
-
-// 	wqe = (struct dtld_recv_wqe *)producer_addr(q);
-
-// 	wqe->wr_id = recv_wr->wr_id;
-
-// 	memcpy(wqe->dma.sge, recv_wr->sg_list,
-// 	       num_sge*sizeof(*wqe->dma.sge));
-
-// 	for (i = 0; i < num_sge; i++)
-// 		length += wqe->dma.sge[i].length;
-
-// 	wqe->dma.length = length;
-// 	wqe->dma.resid = length;
-// 	wqe->dma.cur_sge = 0;
-// 	wqe->dma.num_sge = num_sge;
-// 	wqe->dma.sge_offset = 0;
-
-// 	advance_producer(q);
-
-// out:
-// 	return rc;
 // }
 
 // static int dtld_post_srq_recv(struct ibv_srq *ibsrq,
@@ -1560,270 +1824,6 @@ PROVIDER_DRIVER(dtld, dtld_dev_ops);
 // 	free(qp);
 // err:
 // 	return NULL;
-// }
-
-// /* basic sanity checks for send work request */
-// static int validate_send_wr(struct dtld_qp *qp, struct ibv_send_wr *ibwr,
-// 			    unsigned int length)
-// {
-// 	struct dtld_wq *sq = &qp->sq;
-// 	enum ibv_wr_opcode opcode = ibwr->opcode;
-
-// 	if (ibwr->num_sge > sq->max_sge)
-// 		return EINVAL;
-
-// 	if ((opcode == IBV_WR_ATOMIC_CMP_AND_SWP)
-// 	    || (opcode == IBV_WR_ATOMIC_FETCH_AND_ADD))
-// 		if (length < 8 || ibwr->wr.atomic.remote_addr & 0x7)
-// 			return EINVAL;
-
-// 	if ((ibwr->send_flags & IBV_SEND_INLINE) && (length > sq->max_inline))
-// 		return EINVAL;
-
-// 	if (ibwr->opcode == IBV_WR_BIND_MW) {
-// 		if (length)
-// 			return EINVAL;
-// 		if (ibwr->num_sge)
-// 			return EINVAL;
-// 		if (ibwr->imm_data)
-// 			return EINVAL;
-// 		if ((qp_type(qp) != IBV_QPT_RC) && (qp_type(qp) != IBV_QPT_UC))
-// 			return EINVAL;
-// 	}
-
-// 	return 0;
-// }
-
-// static void convert_send_wr(struct dtld_qp *qp, struct dtld_send_wr *kwr,
-// 					struct ibv_send_wr *uwr)
-// {
-// 	struct ibv_mw *ibmw;
-// 	struct ibv_mr *ibmr;
-
-// 	memset(kwr, 0, sizeof(*kwr));
-
-// 	kwr->wr_id		= uwr->wr_id;
-// 	kwr->opcode		= uwr->opcode;
-// 	kwr->send_flags		= uwr->send_flags;
-// 	kwr->ex.imm_data	= uwr->imm_data;
-
-// 	switch (uwr->opcode) {
-// 	case IBV_WR_RDMA_WRITE:
-// 	case IBV_WR_RDMA_WRITE_WITH_IMM:
-// 	case IBV_WR_RDMA_READ:
-// 		kwr->wr.rdma.remote_addr	= uwr->wr.rdma.remote_addr;
-// 		kwr->wr.rdma.rkey		= uwr->wr.rdma.rkey;
-// 		break;
-
-// 	case IBV_WR_SEND:
-// 	case IBV_WR_SEND_WITH_IMM:
-// 		if (qp_type(qp) == IBV_QPT_UD) {
-// 			struct dtld_ah *ah = to_rah(uwr->wr.ud.ah);
-
-// 			kwr->wr.ud.remote_qpn	= uwr->wr.ud.remote_qpn;
-// 			kwr->wr.ud.remote_qkey	= uwr->wr.ud.remote_qkey;
-// 			kwr->wr.ud.ah_num	= ah->ah_num;
-// 		}
-// 		break;
-
-// 	case IBV_WR_ATOMIC_CMP_AND_SWP:
-// 	case IBV_WR_ATOMIC_FETCH_AND_ADD:
-// 		kwr->wr.atomic.remote_addr	= uwr->wr.atomic.remote_addr;
-// 		kwr->wr.atomic.compare_add	= uwr->wr.atomic.compare_add;
-// 		kwr->wr.atomic.swap		= uwr->wr.atomic.swap;
-// 		kwr->wr.atomic.rkey		= uwr->wr.atomic.rkey;
-// 		break;
-
-// 	case IBV_WR_BIND_MW:
-// 		ibmr = uwr->bind_mw.bind_info.mr;
-// 		ibmw = uwr->bind_mw.mw;
-
-// 		kwr->wr.mw.addr = uwr->bind_mw.bind_info.addr;
-// 		kwr->wr.mw.length = uwr->bind_mw.bind_info.length;
-// 		kwr->wr.mw.mr_lkey = ibmr->lkey;
-// 		kwr->wr.mw.mw_rkey = ibmw->rkey;
-// 		kwr->wr.mw.rkey = uwr->bind_mw.rkey;
-// 		kwr->wr.mw.access = uwr->bind_mw.bind_info.mw_access_flags;
-// 		break;
-
-// 	default:
-// 		break;
-// 	}
-// }
-
-// static int init_send_wqe(struct dtld_qp *qp, struct dtld_wq *sq,
-// 		  struct ibv_send_wr *ibwr, unsigned int length,
-// 		  struct dtld_send_wqe *wqe)
-// {
-// 	int num_sge = ibwr->num_sge;
-// 	int i;
-// 	unsigned int opcode = ibwr->opcode;
-
-// 	convert_send_wr(qp, &wqe->wr, ibwr);
-
-// 	if (qp_type(qp) == IBV_QPT_UD) {
-// 		struct dtld_ah *ah = to_rah(ibwr->wr.ud.ah);
-
-// 		if (!ah->ah_num)
-// 			/* old kernels only */
-// 			memcpy(&wqe->wr.wr.ud.av, &ah->av, sizeof(struct dtld_av));
-// 	}
-
-// 	if (ibwr->send_flags & IBV_SEND_INLINE) {
-// 		uint8_t *inline_data = wqe->dma.inline_data;
-
-// 		for (i = 0; i < num_sge; i++) {
-// 			memcpy(inline_data,
-// 			       (uint8_t *)(long)ibwr->sg_list[i].addr,
-// 			       ibwr->sg_list[i].length);
-// 			inline_data += ibwr->sg_list[i].length;
-// 		}
-// 	} else
-// 		memcpy(wqe->dma.sge, ibwr->sg_list,
-// 		       num_sge*sizeof(struct ibv_sge));
-
-// 	if ((opcode == IBV_WR_ATOMIC_CMP_AND_SWP)
-// 	    || (opcode == IBV_WR_ATOMIC_FETCH_AND_ADD))
-// 		wqe->iova	= ibwr->wr.atomic.remote_addr;
-// 	else
-// 		wqe->iova	= ibwr->wr.rdma.remote_addr;
-
-// 	wqe->dma.length		= length;
-// 	wqe->dma.resid		= length;
-// 	wqe->dma.num_sge	= num_sge;
-// 	wqe->dma.cur_sge	= 0;
-// 	wqe->dma.sge_offset	= 0;
-// 	wqe->state		= 0;
-
-// 	return 0;
-// }
-
-// static int post_one_send(struct dtld_qp *qp, struct dtld_wq *sq,
-// 			 struct ibv_send_wr *ibwr)
-// {
-// 	int err;
-// 	struct dtld_send_wqe *wqe;
-// 	unsigned int length = 0;
-// 	int i;
-
-// 	for (i = 0; i < ibwr->num_sge; i++)
-// 		length += ibwr->sg_list[i].length;
-
-// 	err = validate_send_wr(qp, ibwr, length);
-// 	if (err) {
-// 		verbs_err(verbs_get_ctx(qp->vqp.qp.context),
-// 			  "validate send failed\n");
-// 		return err;
-// 	}
-
-// 	wqe = (struct dtld_send_wqe *)producer_addr(sq->queue);
-
-// 	err = init_send_wqe(qp, sq, ibwr, length, wqe);
-// 	if (err)
-// 		return err;
-
-// 	if (queue_full(sq->queue))
-// 		return ENOMEM;
-
-// 	advance_producer(sq->queue);
-
-// 	return 0;
-// }
-
-// /* send a null post send as a doorbell */
-// static int post_send_db(struct ibv_qp *ibqp)
-// {
-// 	struct ibv_post_send cmd;
-// 	struct ib_uverbs_post_send_resp resp;
-
-// 	cmd.hdr.command	= IB_USER_VERBS_CMD_POST_SEND;
-// 	cmd.hdr.in_words = sizeof(cmd) / 4;
-// 	cmd.hdr.out_words = sizeof(resp) / 4;
-// 	cmd.response	= (uintptr_t)&resp;
-// 	cmd.qp_handle	= ibqp->handle;
-// 	cmd.wr_count	= 0;
-// 	cmd.sge_count	= 0;
-// 	cmd.wqe_size	= sizeof(struct ibv_send_wr);
-
-// 	if (write(ibqp->context->cmd_fd, &cmd, sizeof(cmd)) != sizeof(cmd))
-// 		return errno;
-
-// 	return 0;
-// }
-
-// /* this API does not make a distinction between
-//  * restartable and non-restartable errors
-//  */
-// static int dtld_post_send(struct ibv_qp *ibqp,
-// 			 struct ibv_send_wr *wr_list,
-// 			 struct ibv_send_wr **bad_wr)
-// {
-// 	int rc = 0;
-// 	int err;
-// 	struct dtld_qp *qp = to_rqp(ibqp);
-// 	struct dtld_wq *sq = &qp->sq;
-
-// 	if (!bad_wr)
-// 		return EINVAL;
-
-// 	*bad_wr = NULL;
-
-// 	if (!sq || !wr_list || !sq->queue)
-// 		return EINVAL;
-
-// 	pthread_spin_lock(&sq->lock);
-
-// 	while (wr_list) {
-// 		rc = post_one_send(qp, sq, wr_list);
-// 		if (rc) {
-// 			*bad_wr = wr_list;
-// 			break;
-// 		}
-
-// 		wr_list = wr_list->next;
-// 	}
-
-// 	pthread_spin_unlock(&sq->lock);
-
-// 	err =  post_send_db(ibqp);
-// 	return err ? err : rc;
-// }
-
-// static int dtld_post_recv(struct ibv_qp *ibqp,
-// 			 struct ibv_recv_wr *recv_wr,
-// 			 struct ibv_recv_wr **bad_wr)
-// {
-// 	int rc = 0;
-// 	struct dtld_qp *qp = to_rqp(ibqp);
-// 	struct dtld_wq *rq = &qp->rq;
-
-// 	if (!bad_wr)
-// 		return EINVAL;
-
-// 	*bad_wr = NULL;
-
-// 	if (!rq || !recv_wr || !rq->queue)
-// 		return EINVAL;
-
-// 	/* see C10-97.2.1 */
-// 	if (ibqp->state == IBV_QPS_RESET)
-// 		return EINVAL;
-
-// 	pthread_spin_lock(&rq->lock);
-
-// 	while (recv_wr) {
-// 		rc = dtld_post_one_recv(rq, recv_wr);
-// 		if (rc) {
-// 			*bad_wr = recv_wr;
-// 			break;
-// 		}
-
-// 		recv_wr = recv_wr->next;
-// 	}
-
-// 	pthread_spin_unlock(&rq->lock);
-
-// 	return rc;
 // }
 
 // static inline int ipv6_addr_v4mapped(const struct in6_addr *a)

@@ -123,14 +123,14 @@ static inline struct dtld_qp *to_rqp(struct ibv_qp *ibqp)
 // 	return container_of(ibsrq, struct dtld_srq, vsrq.srq);
 // }
 
-// static inline struct dtld_ah *to_rah(struct ibv_ah *ibah)
-// {
-// 	return to_rxxx(ah, ah);
-// }
+static inline struct dtld_ah *to_rah(struct ibv_ah *ibah)
+{
+	return to_rxxx(ah, ah);
+}
 
-// static inline enum ibv_qp_type qp_type(struct dtld_qp *qp)
-// {
-// 	return qp->vqp.qp.qp_type;
-// }
+static inline enum ibv_qp_type qp_type(struct dtld_qp *qp)
+{
+	return qp->vqp.qp.qp_type;
+}
 
 #endif /* DTLD_H */
