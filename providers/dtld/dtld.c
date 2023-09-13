@@ -166,13 +166,13 @@ static struct ibv_cq *dtld_create_cq(struct ibv_context *context, int cqe,
 	// 	free(cq);
 	// 	return NULL;
 	// }
-
-	cq->wc_size = 1ULL << cq->queue->log2_elem_size;
-
-	if (cq->wc_size < sizeof(struct ib_uverbs_wc)) {
-		dtld_destroy_cq(&cq->vcq.cq);
-		return NULL;
-	}
+	//
+	// cq->wc_size = 1ULL << cq->queue->log2_elem_size;
+	//
+	// if (cq->wc_size < sizeof(struct ib_uverbs_wc)) {
+	// 	dtld_destroy_cq(&cq->vcq.cq);
+	// 	return NULL;
+	// }
 
 	// cq->mmap_info = resp.mi;   // TODO delete me
 	pthread_spin_init(&cq->lock, PTHREAD_PROCESS_PRIVATE);
@@ -257,7 +257,7 @@ static struct ibv_qp *dtld_create_qp(struct ibv_pd *ibpd,
 
 	qp->sq_mmap_info = resp.sq_mi;
 	pthread_spin_init(&qp->sq.lock, PTHREAD_PROCESS_PRIVATE);
-
+	
 	return &qp->vqp.qp;
 
 err_destroy:
