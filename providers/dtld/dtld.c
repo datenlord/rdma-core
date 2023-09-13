@@ -325,6 +325,18 @@ static struct ibv_mr *dtld_reg_mr(struct ibv_pd *pd, void *addr, size_t length,
 	return &vmr->ibv_mr;
 }
 
+static int dtld_dereg_mr(struct verbs_mr *vmr)
+{
+	int ret;
+
+	ret = ibv_cmd_dereg_mr(vmr);
+	if (ret)
+		return ret;
+
+	free(vmr);
+	return 0;
+}
+
 static int dtld_poll_cq(struct ibv_cq *ibcq, int ne, struct ibv_wc *wc)
 {
 	struct dtld_cq *cq = to_rcq(ibcq);
@@ -659,7 +671,7 @@ static const struct verbs_context_ops dtld_ctx_ops = {
 	.alloc_pd = dtld_alloc_pd,
 	.dealloc_pd = dtld_dealloc_pd,
 	.reg_mr = dtld_reg_mr,
-	// .dereg_mr = dtld_dereg_mr,
+	.dereg_mr = dtld_dereg_mr,
 	// .alloc_mw = dtld_alloc_mw,
 	// .dealloc_mw = dtld_dealloc_mw,
 	// .bind_mw = dtld_bind_mw,
@@ -836,18 +848,6 @@ PROVIDER_DRIVER(dtld, dtld_dev_ops);
 // err:
 // 	errno = ret;
 // 	return errno;
-// }
-
-// static int dtld_dereg_mr(struct verbs_mr *vmr)
-// {
-// 	int ret;
-
-// 	ret = ibv_cmd_dereg_mr(vmr);
-// 	if (ret)
-// 		return ret;
-
-// 	free(vmr);
-// 	return 0;
 // }
 
 // static int cq_start_poll(struct ibv_cq_ex *current,
