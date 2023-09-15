@@ -206,28 +206,38 @@ static int map_queue_pair(int cmd_fd, struct dtld_qp *qp,
 		qp->rq_mmap_info.size = 0;
 	} else {
 		qp->rq.max_sge = attr->cap.max_recv_sge;
-		qp->rq.queue = mmap(NULL, resp->rq_mi.size, PROT_READ | PROT_WRITE,
+		qp->rq.queue = mmap(NULL, resp->rq_len, PROT_READ | PROT_WRITE,
 				    MAP_SHARED,
-				    cmd_fd, resp->rq_mi.offset);
+				    cmd_fd, resp->rq_offset);
 		if ((void *)qp->rq.queue == MAP_FAILED)
 			return errno;
 
-		qp->rq_mmap_info = resp->rq_mi;
+		struct mminfo rq_mi = {
+			.size = resp->rq_len,
+			.offset = resp->rq_offset
+		};
+
+		qp->rq_mmap_info = rq_mi;
 		pthread_spin_init(&qp->rq.lock, PTHREAD_PROCESS_PRIVATE);
 	}
 
 	qp->sq.max_sge = attr->cap.max_send_sge;
 	qp->sq.max_inline = attr->cap.max_inline_data;
-	qp->sq.queue = mmap(NULL, resp->sq_mi.size, PROT_READ | PROT_WRITE,
+	qp->sq.queue = mmap(NULL, resp->sq_len, PROT_READ | PROT_WRITE,
 			    MAP_SHARED,
-			    cmd_fd, resp->sq_mi.offset);
+			    cmd_fd, resp->sq_offset);
 	if ((void *)qp->sq.queue == MAP_FAILED) {
 		if (qp->rq_mmap_info.size)
 			munmap(qp->rq.queue, qp->rq_mmap_info.size);
 		return errno;
 	}
 
-	qp->sq_mmap_info = resp->sq_mi;
+	struct mminfo sq_mi = {
+		.size = resp->sq_len,
+		.offset = resp->sq_offset
+	};
+
+	qp->sq_mmap_info = sq_mi;
 	pthread_spin_init(&qp->sq.lock, PTHREAD_PROCESS_PRIVATE);
 
 	return 0;
@@ -255,7 +265,12 @@ static struct ibv_qp *dtld_create_qp(struct ibv_pd *ibpd,
 	if (ret)
 		goto err_destroy;
 
-	qp->sq_mmap_info = resp.sq_mi;
+	struct mminfo sq_mi = {
+		.size = resp.sq_len,
+		.offset = resp.sq_offset
+	};
+
+	qp->sq_mmap_info = sq_mi;
 	pthread_spin_init(&qp->sq.lock, PTHREAD_PROCESS_PRIVATE);
 	
 	return &qp->vqp.qp;

@@ -193,8 +193,10 @@ struct dtld_resize_cq_resp {
 };
 
 struct dtld_create_qp_resp {
-	struct mminfo rq_mi;
-	struct mminfo sq_mi;
+	__aligned_u64 rq_offset;
+	__aligned_u64 sq_offset;
+	__aligned_u64 rq_len;
+	__aligned_u64 sq_len;
 };
 
 struct dtld_create_srq_resp {
