@@ -136,9 +136,9 @@ static struct ibv_cq *dtld_create_cq(struct ibv_context *context, int cqe,
 {
 	struct dtld_cq *cq;
 	struct udtld_create_cq req = {};
-	struct dtld_create_cq_req *req_drv_data;
+	struct dtld_ureq_create_cq *req_drv_data;
 	struct udtld_create_cq_resp resp = {};
-	struct dtld_create_cq_resp *resp_drv_data;
+	struct dtld_uresp_create_cq *resp_drv_data;
 	int ret;
 
 	cq = calloc(1, sizeof(*cq));
@@ -147,9 +147,7 @@ static struct ibv_cq *dtld_create_cq(struct ibv_context *context, int cqe,
 
 	req_drv_data = &req.drv_payload;
 	resp_drv_data = &resp.drv_payload;
-
-	req_drv_data->buf_addr = 0xaabbaabb; // TODO magic number as placeholder, fix me
-
+	
 	ret = ibv_cmd_create_cq(context, cqe, channel, comp_vector,
 				&cq->vcq.cq, &req.ibv_cmd, sizeof(req),
 				&resp.ibv_resp, sizeof(resp));
@@ -158,14 +156,13 @@ static struct ibv_cq *dtld_create_cq(struct ibv_context *context, int cqe,
 		return NULL;
 	}
 
-	// TODO Delete me
-	// cq->queue = mmap(NULL, resp.mi.size, PROT_READ | PROT_WRITE, MAP_SHARED,
-	// 		 context->cmd_fd, resp.mi.offset);
-	// if ((void *)cq->queue == MAP_FAILED) {
-	// 	ibv_cmd_destroy_cq(&cq->vcq.cq);
-	// 	free(cq);
-	// 	return NULL;
-	// }
+	cq->queue = mmap(NULL, resp_drv_data->q_length , PROT_READ | PROT_WRITE, MAP_SHARED,
+			 context->cmd_fd, resp_drv_data->q_offset);
+	if ((void *)cq->queue == MAP_FAILED) {
+		ibv_cmd_destroy_cq(&cq->vcq.cq);
+		free(cq);
+		return NULL;
+	}
 	//
 	// cq->wc_size = 1ULL << cq->queue->log2_elem_size;
 	//
@@ -174,7 +171,6 @@ static struct ibv_cq *dtld_create_cq(struct ibv_context *context, int cqe,
 	// 	return NULL;
 	// }
 
-	// cq->mmap_info = resp.mi;   // TODO delete me
 	pthread_spin_init(&cq->lock, PTHREAD_PROCESS_PRIVATE);
 
 	return &cq->vcq.cq;
