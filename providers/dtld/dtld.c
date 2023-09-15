@@ -194,7 +194,7 @@ static int dtld_destroy_cq(struct ibv_cq *ibcq)
 
 static int map_queue_pair(int cmd_fd, struct dtld_qp *qp,
 			  struct ibv_qp_init_attr *attr,
-			  struct dtld_create_qp_resp *resp)
+			  struct dtld_uresp_create_qp *resp)
 {
 	if (attr->srq) {
 		qp->rq.max_sge = 0;
@@ -243,7 +243,7 @@ static struct ibv_qp *dtld_create_qp(struct ibv_pd *ibpd,
 				    struct ibv_qp_init_attr *attr)
 {
 	struct ibv_create_qp cmd = {};
-	struct udtld_create_qp_resp resp = {};
+	struct dtld_uresp_create_qp resp = {};
 	struct dtld_qp *qp;
 	int ret;
 
@@ -252,12 +252,12 @@ static struct ibv_qp *dtld_create_qp(struct ibv_pd *ibpd,
 		goto err;
 
 	ret = ibv_cmd_create_qp(ibpd, &qp->vqp.qp, attr, &cmd, sizeof(cmd),
-				&resp.ibv_resp, sizeof(resp));
+				&resp, sizeof(resp));
 	if (ret)
 		goto err_free;
 
 	ret = map_queue_pair(ibpd->context->cmd_fd, qp, attr,
-			     &resp.drv_payload);
+			     &resp);
 	if (ret)
 		goto err_destroy;
 
