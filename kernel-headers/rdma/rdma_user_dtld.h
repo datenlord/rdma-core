@@ -190,9 +190,14 @@ struct dtld_resize_cq_resp {
 	struct mminfo mi;
 };
 
-struct dtld_create_qp_resp {
-	struct mminfo rq_mi;
-	struct mminfo sq_mi;
+struct dtld_ureq_create_qp {
+};
+
+struct dtld_uresp_create_qp {
+	__aligned_u64 rq_offset;
+	__aligned_u64 sq_offset;
+	__aligned_u64 rq_len;
+	__aligned_u64 sq_len;
 };
 
 struct dtld_create_srq_resp {

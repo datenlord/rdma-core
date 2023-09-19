@@ -46,9 +46,9 @@ DECLARE_DRV_CMD(udtld_create_cq, IB_USER_VERBS_CMD_CREATE_CQ,
 DECLARE_DRV_CMD(udtld_create_cq_ex, IB_USER_VERBS_EX_CMD_CREATE_CQ,
 		empty, dtld_uresp_create_cq);
 DECLARE_DRV_CMD(udtld_create_qp, IB_USER_VERBS_CMD_CREATE_QP,
-		empty, dtld_create_qp_resp);
+		dtld_ureq_create_qp, dtld_uresp_create_qp);
 DECLARE_DRV_CMD(udtld_create_qp_ex, IB_USER_VERBS_EX_CMD_CREATE_QP,
-		empty, dtld_create_qp_resp);
+		empty, dtld_uresp_create_qp);
 DECLARE_DRV_CMD(udtld_create_srq, IB_USER_VERBS_CMD_CREATE_SRQ,
 		empty, dtld_create_srq_resp);
 DECLARE_DRV_CMD(udtld_create_srq_ex, IB_USER_VERBS_CMD_CREATE_XSRQ,
