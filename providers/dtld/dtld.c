@@ -246,12 +246,12 @@ static struct ibv_qp *dtld_create_qp(struct ibv_pd *ibpd,
 	if (ret)
 		goto err_free;
 
-	ret = map_queue_pair(ibpd->context->cmd_fd, qp, attr,
-			     &resp.drv_payload);
-	if (ret)
-		goto err_destroy;
+	// ret = map_queue_pair(ibpd->context->cmd_fd, qp, attr,
+	// 		     &resp.drv_payload);
+	// if (ret)
+	// 	goto err_destroy;
 
-	qp->sq_mmap_info = resp.sq_mi;
+	// qp->sq_mmap_info = resp.sq_mi;
 	pthread_spin_init(&qp->sq.lock, PTHREAD_PROCESS_PRIVATE);
 	
 	return &qp->vqp.qp;
@@ -503,23 +503,23 @@ static int post_one_send(struct dtld_qp *qp, struct dtld_wq *sq,
 	for (i = 0; i < ibwr->num_sge; i++)
 		length += ibwr->sg_list[i].length;
 
-	err = validate_send_wr(qp, ibwr, length);
-	if (err) {
-		verbs_err(verbs_get_ctx(qp->vqp.qp.context),
-			  "validate send failed\n");
-		return err;
-	}
+	// err = validate_send_wr(qp, ibwr, length);
+	// if (err) {
+	// 	verbs_err(verbs_get_ctx(qp->vqp.qp.context),
+	// 		  "validate send failed\n");
+	// 	return err;
+	// }
 
-	wqe = (struct dtld_send_wqe *)producer_addr(sq->queue);
+	// wqe = (struct dtld_send_wqe *)producer_addr(sq->queue);
 
-	err = init_send_wqe(qp, sq, ibwr, length, wqe);
-	if (err)
-		return err;
+	// err = init_send_wqe(qp, sq, ibwr, length, wqe);
+	// if (err)
+	// 	return err;
 
-	if (queue_full(sq->queue))
-		return ENOMEM;
+	// if (queue_full(sq->queue))
+	// 	return ENOMEM;
 
-	advance_producer(sq->queue);
+	// advance_producer(sq->queue);
 
 	return 0;
 }
@@ -527,21 +527,7 @@ static int post_one_send(struct dtld_qp *qp, struct dtld_wq *sq,
 /* send a null post send as a doorbell */
 static int post_send_db(struct ibv_qp *ibqp)
 {
-	struct ibv_post_send cmd;
-	struct ib_uverbs_post_send_resp resp;
-
-	cmd.hdr.command	= IB_USER_VERBS_CMD_POST_SEND;
-	cmd.hdr.in_words = sizeof(cmd) / 4;
-	cmd.hdr.out_words = sizeof(resp) / 4;
-	cmd.response	= (uintptr_t)&resp;
-	cmd.qp_handle	= ibqp->handle;
-	cmd.wr_count	= 0;
-	cmd.sge_count	= 0;
-	cmd.wqe_size	= sizeof(struct ibv_send_wr);
-
-	if (write(ibqp->context->cmd_fd, &cmd, sizeof(cmd)) != sizeof(cmd))
-		return errno;
-
+	// TODO implement doorbell on hardware.
 	return 0;
 }
 
@@ -562,10 +548,11 @@ static int dtld_post_send(struct ibv_qp *ibqp,
 
 	*bad_wr = NULL;
 
-	if (!sq || !wr_list || !sq->queue)
-		return EINVAL;
+	// TODO: Check for rq->queue when sq has been created.
+	// if (!sq || !wr_list || !sq->queue)
+	// 	return EINVAL;
 
-	pthread_spin_lock(&sq->lock);
+	// pthread_spin_lock(&sq->lock);
 
 	while (wr_list) {
 		rc = post_one_send(qp, sq, wr_list);
@@ -577,7 +564,7 @@ static int dtld_post_send(struct ibv_qp *ibqp,
 		wr_list = wr_list->next;
 	}
 
-	pthread_spin_unlock(&sq->lock);
+	// pthread_spin_unlock(&sq->lock);
 
 	err =  post_send_db(ibqp);
 	return err ? err : rc;
@@ -592,33 +579,33 @@ static int dtld_post_one_recv(struct dtld_wq *rq, struct ibv_recv_wr *recv_wr)
 	int length = 0;
 	int rc = 0;
 
-	if (queue_full(q)) {
-		rc  = ENOMEM;
-		goto out;
-	}
+	// if (queue_full(q)) {
+	// 	rc  = ENOMEM;
+	// 	goto out;
+	// }
 
-	if (num_sge > rq->max_sge) {
-		rc = EINVAL;
-		goto out;
-	}
+	// if (num_sge > rq->max_sge) {
+	// 	rc = EINVAL;
+	// 	goto out;
+	// }
 
-	wqe = (struct dtld_recv_wqe *)producer_addr(q);
+	// wqe = (struct dtld_recv_wqe *)producer_addr(q);
 
-	wqe->wr_id = recv_wr->wr_id;
+	// wqe->wr_id = recv_wr->wr_id;
 
-	memcpy(wqe->dma.sge, recv_wr->sg_list,
-	       num_sge*sizeof(*wqe->dma.sge));
+	// memcpy(wqe->dma.sge, recv_wr->sg_list,
+	//        num_sge*sizeof(*wqe->dma.sge));
 
-	for (i = 0; i < num_sge; i++)
-		length += wqe->dma.sge[i].length;
+	// for (i = 0; i < num_sge; i++)
+	// 	length += wqe->dma.sge[i].length;
 
-	wqe->dma.length = length;
-	wqe->dma.resid = length;
-	wqe->dma.cur_sge = 0;
-	wqe->dma.num_sge = num_sge;
-	wqe->dma.sge_offset = 0;
+	// wqe->dma.length = length;
+	// wqe->dma.resid = length;
+	// wqe->dma.cur_sge = 0;
+	// wqe->dma.num_sge = num_sge;
+	// wqe->dma.sge_offset = 0;
 
-	advance_producer(q);
+	// advance_producer(q);
 
 out:
 	return rc;
@@ -637,14 +624,16 @@ static int dtld_post_recv(struct ibv_qp *ibqp,
 
 	*bad_wr = NULL;
 
-	if (!rq || !recv_wr || !rq->queue)
-		return EINVAL;
+	// TODO: Check for rq->queue when rq has been created.
+	// if (!rq || !recv_wr || !rq->queue)
+	// 	return EINVAL;
 
+	// TODO: Check for rq->queue when qp has been created.
 	/* see C10-97.2.1 */
-	if (ibqp->state == IBV_QPS_RESET)
-		return EINVAL;
+	// if (ibqp->state == IBV_QPS_RESET)
+	// 	return EINVAL;
 
-	pthread_spin_lock(&rq->lock);
+	// pthread_spin_lock(&rq->lock);
 
 	while (recv_wr) {
 		rc = dtld_post_one_recv(rq, recv_wr);
