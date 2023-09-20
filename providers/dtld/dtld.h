@@ -42,6 +42,9 @@
 #include <rdma/rdma_user_dtld.h>
 #include "dtld-abi.h"
 
+#define MAX_WR_IN_SINGLE_POST_REQUEST 1
+#define MAX_SG_LIST_LENGTH_FOR_WR 1
+
 struct dtld_device {
 	struct verbs_device	ibv_dev;
 	int	abi_version;
@@ -49,6 +52,9 @@ struct dtld_device {
 
 struct dtld_context {
 	struct verbs_context	ibv_ctx;
+
+	// only for simulation demo use, delete me later
+	atomic_int sim_cq_cnt;
 };
 
 /* common between cq and cq_ex */

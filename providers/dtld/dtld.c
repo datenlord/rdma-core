@@ -243,7 +243,10 @@ static struct ibv_qp *dtld_create_qp(struct ibv_pd *ibpd,
 				    struct ibv_qp_init_attr *attr)
 {
 	struct ibv_create_qp cmd = {};
-	struct dtld_uresp_create_qp resp = {};
+
+	struct udtld_create_qp_resp resp = {};
+	struct dtld_uresp_create_qp *resp_drv_data;
+
 	struct dtld_qp *qp;
 	int ret;
 
@@ -252,7 +255,7 @@ static struct ibv_qp *dtld_create_qp(struct ibv_pd *ibpd,
 		goto err;
 
 	ret = ibv_cmd_create_qp(ibpd, &qp->vqp.qp, attr, &cmd, sizeof(cmd),
-				&resp, sizeof(resp));
+				&resp.ibv_resp, sizeof(resp));
 	if (ret)
 		goto err_free;
 
@@ -346,23 +349,43 @@ static int dtld_dereg_mr(struct verbs_mr *vmr)
 static int dtld_poll_cq(struct ibv_cq *ibcq, int ne, struct ibv_wc *wc)
 {
 	struct dtld_cq *cq = to_rcq(ibcq);
+	struct dtld_context *ctx = to_rctx(ibcq->context);
+	
+
 	struct dtld_queue_buf *q;
 	int npolled;
 	uint8_t *src;
 
-	pthread_spin_lock(&cq->lock);
-	q = cq->queue;
+	// pthread_spin_lock(&cq->lock);
+	// q = cq->queue;
 
-	for (npolled = 0; npolled < ne; ++npolled, ++wc) {
-		if (queue_empty(q))
-			break;
+	// for (npolled = 0; npolled < ne; ++npolled, ++wc) {
+	// 	if (queue_empty(q))
+	// 		break;
 
-		src = consumer_addr(q);
-		memcpy(wc, src, sizeof(*wc));
-		advance_consumer(q);
+	// 	src = consumer_addr(q);
+	// 	memcpy(wc, src, sizeof(*wc));
+	// 	advance_consumer(q);
+	// }
+
+	// pthread_spin_unlock(&cq->lock);
+
+	npolled = atomic_load(&ctx->sim_cq_cnt);
+	if (!npolled)
+		goto no_entry_out;
+	
+	if (!atomic_compare_exchange_strong(&ctx->sim_cq_cnt, &npolled, npolled-1)) {
+		npolled = 0;
+		goto no_entry_out;
 	}
 
-	pthread_spin_unlock(&cq->lock);
+	// make 2 fake wc
+	wc[0].wr_id = 1;
+	wc[1].wr_id = 2;
+
+	npolled = 2;
+
+no_entry_out:
 	return npolled;
 }
 
@@ -553,6 +576,8 @@ static int dtld_post_send(struct ibv_qp *ibqp,
 	struct dtld_qp *qp = to_rqp(ibqp);
 	struct dtld_wq *sq = &qp->sq;
 
+	struct dtld_context *ctx = to_rctx(ibqp->context);
+
 	if (!bad_wr)
 		return EINVAL;
 
@@ -570,6 +595,8 @@ static int dtld_post_send(struct ibv_qp *ibqp,
 			*bad_wr = wr_list;
 			break;
 		}
+
+		atomic_fetch_add(&ctx->sim_cq_cnt, 1);
 
 		wr_list = wr_list->next;
 	}

@@ -523,9 +523,9 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
 		if (use_new_send)
 			ctx->qpx = ibv_qp_to_qp_ex(ctx->qp);
 
-		ibv_query_qp(ctx->qp, &attr, IBV_QP_CAP, &init_attr);
-		if (init_attr.cap.max_inline_data >= size && !use_dm)
-			ctx->send_flags |= IBV_SEND_INLINE;
+		// ibv_query_qp(ctx->qp, &attr, IBV_QP_CAP, &init_attr);
+		// if (init_attr.cap.max_inline_data >= size && !use_dm)
+		// 	ctx->send_flags |= IBV_SEND_INLINE;
 	}
 
 	{
@@ -536,14 +536,14 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
 			.qp_access_flags = 0
 		};
 
-		if (ibv_modify_qp(ctx->qp, &attr,
-				  IBV_QP_STATE              |
-				  IBV_QP_PKEY_INDEX         |
-				  IBV_QP_PORT               |
-				  IBV_QP_ACCESS_FLAGS)) {
-			fprintf(stderr, "Failed to modify QP to INIT\n");
-			goto clean_qp;
-		}
+		// if (ibv_modify_qp(ctx->qp, &attr,
+		// 		  IBV_QP_STATE              |
+		// 		  IBV_QP_PKEY_INDEX         |
+		// 		  IBV_QP_PORT               |
+		// 		  IBV_QP_ACCESS_FLAGS)) {
+		// 	fprintf(stderr, "Failed to modify QP to INIT\n");
+		// 	goto clean_qp;
+		// }
 	}
 
 	return ctx;
@@ -1026,27 +1026,27 @@ int main(int argc, char *argv[])
 	       my_dest.lid, my_dest.qpn, my_dest.psn, gid);
 
 
-	if (servername)
-		rem_dest = pp_client_exch_dest(servername, port, &my_dest);
-	else
-		rem_dest = pp_server_exch_dest(ctx, ib_port, mtu, port, sl,
-								&my_dest, gidx);
+	// if (servername)
+	// 	rem_dest = pp_client_exch_dest(servername, port, &my_dest);
+	// else
+	// 	rem_dest = pp_server_exch_dest(ctx, ib_port, mtu, port, sl,
+	// 							&my_dest, gidx);
 
-	if (!rem_dest)
-		return 1;
+	// if (!rem_dest)
+	// 	return 1;
 
-	inet_ntop(AF_INET6, &rem_dest->gid, gid, sizeof gid);
-	printf("  remote address: LID 0x%04x, QPN 0x%06x, PSN 0x%06x, GID %s\n",
-	       rem_dest->lid, rem_dest->qpn, rem_dest->psn, gid);
+	// inet_ntop(AF_INET6, &rem_dest->gid, gid, sizeof gid);
+	// printf("  remote address: LID 0x%04x, QPN 0x%06x, PSN 0x%06x, GID %s\n",
+	//        rem_dest->lid, rem_dest->qpn, rem_dest->psn, gid);
 
-	if (servername)
-		if (pp_connect_ctx(ctx, ib_port, my_dest.psn, mtu, sl, rem_dest,
-					gidx))
-			return 1;
+	// if (servername)
+	// 	if (pp_connect_ctx(ctx, ib_port, my_dest.psn, mtu, sl, rem_dest,
+	// 				gidx))
+	// 		return 1;
 
 	ctx->pending = PINGPONG_RECV_WRID;
 
-	if (servername) {
+	if (!servername) {
 		if (validate_buf)
 			for (int i = 0; i < size; i += page_size)
 				ctx->buf[i] = i / page_size % sizeof(char);
