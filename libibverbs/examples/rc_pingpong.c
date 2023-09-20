@@ -523,9 +523,9 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
 		if (use_new_send)
 			ctx->qpx = ibv_qp_to_qp_ex(ctx->qp);
 
-		// ibv_query_qp(ctx->qp, &attr, IBV_QP_CAP, &init_attr);
-		// if (init_attr.cap.max_inline_data >= size && !use_dm)
-		// 	ctx->send_flags |= IBV_SEND_INLINE;
+		ibv_query_qp(ctx->qp, &attr, IBV_QP_CAP, &init_attr);
+		if (init_attr.cap.max_inline_data >= size && !use_dm)
+			ctx->send_flags |= IBV_SEND_INLINE;
 	}
 
 	{
@@ -536,14 +536,14 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
 			.qp_access_flags = 0
 		};
 
-		// if (ibv_modify_qp(ctx->qp, &attr,
-		// 		  IBV_QP_STATE              |
-		// 		  IBV_QP_PKEY_INDEX         |
-		// 		  IBV_QP_PORT               |
-		// 		  IBV_QP_ACCESS_FLAGS)) {
-		// 	fprintf(stderr, "Failed to modify QP to INIT\n");
-		// 	goto clean_qp;
-		// }
+		if (ibv_modify_qp(ctx->qp, &attr,
+				  IBV_QP_STATE              |
+				  IBV_QP_PKEY_INDEX         |
+				  IBV_QP_PORT               |
+				  IBV_QP_ACCESS_FLAGS)) {
+			fprintf(stderr, "Failed to modify QP to INIT\n");
+			goto clean_qp;
+		}
 	}
 
 	return ctx;

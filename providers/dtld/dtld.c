@@ -259,10 +259,10 @@ static struct ibv_qp *dtld_create_qp(struct ibv_pd *ibpd,
 	if (ret)
 		goto err_free;
 
-	// ret = map_queue_pair(ibpd->context->cmd_fd, qp, attr,
-	// 		     &resp.drv_payload);
-	// if (ret)
-	// 	goto err_destroy;
+	ret = map_queue_pair(ibpd->context->cmd_fd, qp, attr,
+			     &resp.drv_payload);
+	if (ret)
+		goto err_destroy;
 
 	// qp->sq_mmap_info = resp.sq_mi;
 	pthread_spin_init(&qp->sq.lock, PTHREAD_PROCESS_PRIVATE);
