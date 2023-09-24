@@ -52,9 +52,6 @@ struct dtld_device {
 
 struct dtld_context {
 	struct verbs_context	ibv_ctx;
-
-	// only for simulation demo use, delete me later
-	atomic_int sim_cq_cnt;
 };
 
 /* common between cq and cq_ex */

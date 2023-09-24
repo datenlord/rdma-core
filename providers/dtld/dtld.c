@@ -353,7 +353,7 @@ static int dtld_poll_cq(struct ibv_cq *ibcq, int ne, struct ibv_wc *wc)
 	
 
 	struct dtld_queue_buf *q;
-	int npolled;
+	int npolled = 0;
 	uint8_t *src;
 
 	// pthread_spin_lock(&cq->lock);
@@ -370,20 +370,16 @@ static int dtld_poll_cq(struct ibv_cq *ibcq, int ne, struct ibv_wc *wc)
 
 	// pthread_spin_unlock(&cq->lock);
 
-	npolled = atomic_load(&ctx->sim_cq_cnt);
-	if (!npolled)
-		goto no_entry_out;
+	// (addr + 6 * 4) is the demo status register. if it reads out as 1, 
+	// it means there is something ready. the hardware reg will be cleared on read.
 	
-	if (!atomic_compare_exchange_strong(&ctx->sim_cq_cnt, &npolled, npolled-1)) {
-		npolled = 0;
-		goto no_entry_out;
+	if (*((uint32_t *)cq->queue + 6)) {
+		// make 2 fake wc
+		wc[0].wr_id = 1;
+		wc[1].wr_id = 2;
+
+		npolled = 2;
 	}
-
-	// make 2 fake wc
-	wc[0].wr_id = 1;
-	wc[1].wr_id = 2;
-
-	npolled = 2;
 
 no_entry_out:
 	return npolled;
@@ -596,7 +592,8 @@ static int dtld_post_send(struct ibv_qp *ibqp,
 			break;
 		}
 
-		atomic_fetch_add(&ctx->sim_cq_cnt, 1);
+		// (addr + 5 * 4) is the demo trigger addr 
+		*((uint32_t*)qp->sq.queue+5) = 1;
 
 		wr_list = wr_list->next;
 	}
