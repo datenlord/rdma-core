@@ -52,7 +52,6 @@
 #include <infiniband/driver.h>
 #include <infiniband/verbs.h>
 
-#include "dtld_queue.h"
 #include "dtld-abi.h"
 #include "dtld.h"
 
@@ -170,6 +169,13 @@ static struct ibv_cq *dtld_create_cq(struct ibv_context *context, int cqe,
 	// 	dtld_destroy_cq(&cq->vcq.cq);
 	// 	return NULL;
 	// }
+
+	struct mminfo sq_mi = {
+		.size = resp.q_length,
+		.offset = resp.q_offset
+	};
+
+	cq->mmap_info = sq_mi;
 
 	pthread_spin_init(&cq->lock, PTHREAD_PROCESS_PRIVATE);
 
@@ -350,29 +356,12 @@ static int dtld_poll_cq(struct ibv_cq *ibcq, int ne, struct ibv_wc *wc)
 {
 	struct dtld_cq *cq = to_rcq(ibcq);
 	struct dtld_context *ctx = to_rctx(ibcq->context);
-	
-
-	struct dtld_queue_buf *q;
 	int npolled = 0;
-	uint8_t *src;
 
-	// pthread_spin_lock(&cq->lock);
-	// q = cq->queue;
-
-	// for (npolled = 0; npolled < ne; ++npolled, ++wc) {
-	// 	if (queue_empty(q))
-	// 		break;
-
-	// 	src = consumer_addr(q);
-	// 	memcpy(wc, src, sizeof(*wc));
-	// 	advance_consumer(q);
-	// }
-
-	// pthread_spin_unlock(&cq->lock);
+	pthread_spin_lock(&cq->lock);
 
 	// (addr + 6 * 4) is the demo status register. if it reads out as 1, 
 	// it means there is something ready. the hardware reg will be cleared on read.
-	
 	if (*((uint32_t *)cq->queue + 6)) {
 		// make 2 fake wc
 		wc[0].wr_id = 1;
@@ -380,66 +369,10 @@ static int dtld_poll_cq(struct ibv_cq *ibcq, int ne, struct ibv_wc *wc)
 
 		npolled = 2;
 	}
+	pthread_spin_unlock(&cq->lock);
 
 no_entry_out:
 	return npolled;
-}
-
-static void convert_send_wr(struct dtld_qp *qp, struct dtld_send_wr *kwr,
-					struct ibv_send_wr *uwr)
-{
-	struct ibv_mw *ibmw;
-	struct ibv_mr *ibmr;
-
-	memset(kwr, 0, sizeof(*kwr));
-
-	kwr->wr_id		= uwr->wr_id;
-	kwr->opcode		= uwr->opcode;
-	kwr->send_flags		= uwr->send_flags;
-	kwr->ex.imm_data	= uwr->imm_data;
-
-	switch (uwr->opcode) {
-	case IBV_WR_RDMA_WRITE:
-	case IBV_WR_RDMA_WRITE_WITH_IMM:
-	case IBV_WR_RDMA_READ:
-		kwr->wr.rdma.remote_addr	= uwr->wr.rdma.remote_addr;
-		kwr->wr.rdma.rkey		= uwr->wr.rdma.rkey;
-		break;
-
-	case IBV_WR_SEND:
-	case IBV_WR_SEND_WITH_IMM:
-		if (qp_type(qp) == IBV_QPT_UD) {
-			struct dtld_ah *ah = to_rah(uwr->wr.ud.ah);
-
-			kwr->wr.ud.remote_qpn	= uwr->wr.ud.remote_qpn;
-			kwr->wr.ud.remote_qkey	= uwr->wr.ud.remote_qkey;
-			kwr->wr.ud.ah_num	= ah->ah_num;
-		}
-		break;
-
-	case IBV_WR_ATOMIC_CMP_AND_SWP:
-	case IBV_WR_ATOMIC_FETCH_AND_ADD:
-		kwr->wr.atomic.remote_addr	= uwr->wr.atomic.remote_addr;
-		kwr->wr.atomic.compare_add	= uwr->wr.atomic.compare_add;
-		kwr->wr.atomic.swap		= uwr->wr.atomic.swap;
-		kwr->wr.atomic.rkey		= uwr->wr.atomic.rkey;
-		break;
-
-	case IBV_WR_BIND_MW:
-		ibmr = uwr->bind_mw.bind_info.mr;
-		ibmw = uwr->bind_mw.mw;
-
-		kwr->wr.mw.addr = uwr->bind_mw.bind_info.addr;
-		kwr->wr.mw.length = uwr->bind_mw.bind_info.length;
-		kwr->wr.mw.mr_lkey = ibmr->lkey;
-		kwr->wr.mw.mw_rkey = ibmw->rkey;
-		kwr->wr.mw.rkey = uwr->bind_mw.rkey;
-		kwr->wr.mw.access = uwr->bind_mw.bind_info.mw_access_flags;
-		break;
-
-	default:
-		break;
-	}
 }
 
 /* basic sanity checks for send work request */
@@ -478,45 +411,8 @@ static int init_send_wqe(struct dtld_qp *qp, struct dtld_wq *sq,
 		  struct ibv_send_wr *ibwr, unsigned int length,
 		  struct dtld_send_wqe *wqe)
 {
-	int num_sge = ibwr->num_sge;
-	int i;
-	unsigned int opcode = ibwr->opcode;
-
-	convert_send_wr(qp, &wqe->wr, ibwr);
-
-	if (qp_type(qp) == IBV_QPT_UD) {
-		struct dtld_ah *ah = to_rah(ibwr->wr.ud.ah);
-
-		if (!ah->ah_num)
-			/* old kernels only */
-			memcpy(&wqe->wr.wr.ud.av, &ah->av, sizeof(struct dtld_av));
-	}
-
-	if (ibwr->send_flags & IBV_SEND_INLINE) {
-		uint8_t *inline_data = wqe->dma.inline_data;
-
-		for (i = 0; i < num_sge; i++) {
-			memcpy(inline_data,
-			       (uint8_t *)(long)ibwr->sg_list[i].addr,
-			       ibwr->sg_list[i].length);
-			inline_data += ibwr->sg_list[i].length;
-		}
-	} else
-		memcpy(wqe->dma.sge, ibwr->sg_list,
-		       num_sge*sizeof(struct ibv_sge));
-
-	if ((opcode == IBV_WR_ATOMIC_CMP_AND_SWP)
-	    || (opcode == IBV_WR_ATOMIC_FETCH_AND_ADD))
-		wqe->iova	= ibwr->wr.atomic.remote_addr;
-	else
-		wqe->iova	= ibwr->wr.rdma.remote_addr;
-
-	wqe->dma.length		= length;
-	wqe->dma.resid		= length;
-	wqe->dma.num_sge	= num_sge;
-	wqe->dma.cur_sge	= 0;
-	wqe->dma.sge_offset	= 0;
-	wqe->state		= 0;
+	// TODO: convert software format to hardware format.
+	// TODO: change `struct dtld_send_wqe` to match real hardware.
 
 	return 0;
 }
@@ -532,23 +428,7 @@ static int post_one_send(struct dtld_qp *qp, struct dtld_wq *sq,
 	for (i = 0; i < ibwr->num_sge; i++)
 		length += ibwr->sg_list[i].length;
 
-	// err = validate_send_wr(qp, ibwr, length);
-	// if (err) {
-	// 	verbs_err(verbs_get_ctx(qp->vqp.qp.context),
-	// 		  "validate send failed\n");
-	// 	return err;
-	// }
-
-	// wqe = (struct dtld_send_wqe *)producer_addr(sq->queue);
-
-	// err = init_send_wqe(qp, sq, ibwr, length, wqe);
-	// if (err)
-	// 	return err;
-
-	// if (queue_full(sq->queue))
-	// 	return ENOMEM;
-
-	// advance_producer(sq->queue);
+	// TODO: communicate with real hardware.
 
 	return 0;
 }
@@ -613,33 +493,7 @@ static int dtld_post_one_recv(struct dtld_wq *rq, struct ibv_recv_wr *recv_wr)
 	int length = 0;
 	int rc = 0;
 
-	// if (queue_full(q)) {
-	// 	rc  = ENOMEM;
-	// 	goto out;
-	// }
-
-	// if (num_sge > rq->max_sge) {
-	// 	rc = EINVAL;
-	// 	goto out;
-	// }
-
-	// wqe = (struct dtld_recv_wqe *)producer_addr(q);
-
-	// wqe->wr_id = recv_wr->wr_id;
-
-	// memcpy(wqe->dma.sge, recv_wr->sg_list,
-	//        num_sge*sizeof(*wqe->dma.sge));
-
-	// for (i = 0; i < num_sge; i++)
-	// 	length += wqe->dma.sge[i].length;
-
-	// wqe->dma.length = length;
-	// wqe->dma.resid = length;
-	// wqe->dma.cur_sge = 0;
-	// wqe->dma.num_sge = num_sge;
-	// wqe->dma.sge_offset = 0;
-
-	// advance_producer(q);
+	// TODO: communicate with real hardware.
 
 out:
 	return rc;

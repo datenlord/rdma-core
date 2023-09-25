@@ -72,59 +72,6 @@ struct dtld_av {
 	} sgid_addr, dgid_addr;
 };
 
-struct dtld_send_wr {
-	__aligned_u64		wr_id;
-	__u32			num_sge;
-	__u32			opcode;
-	__u32			send_flags;
-	union {
-		__be32		imm_data;
-		__u32		invalidate_rkey;
-	} ex;
-	union {
-		struct {
-			__aligned_u64 remote_addr;
-			__u32	rkey;
-			__u32	reserved;
-		} rdma;
-		struct {
-			__aligned_u64 remote_addr;
-			__aligned_u64 compare_add;
-			__aligned_u64 swap;
-			__u32	rkey;
-			__u32	reserved;
-		} atomic;
-		struct {
-			__u32	remote_qpn;
-			__u32	remote_qkey;
-			__u16	pkey_index;
-			__u16	reserved;
-			__u32	ah_num;
-			__u32	pad[4];
-			struct dtld_av av;
-		} ud;
-		struct {
-			__aligned_u64	addr;
-			__aligned_u64	length;
-			__u32		mr_lkey;
-			__u32		mw_rkey;
-			__u32		rkey;
-			__u32		access;
-		} mw;
-		/* reg is only used by the kernel and is not part of the uapi */
-#ifdef __KERNEL__
-		struct {
-			union {
-				struct ib_mr *mr;
-				__aligned_u64 reserved;
-			};
-			__u32	     key;
-			__u32	     access;
-		} reg;
-#endif
-	} wr;
-};
-
 struct dtld_sge {
 	__aligned_u64 addr;
 	__u32	length;
@@ -137,38 +84,14 @@ struct mminfo {
 	__u32			pad;
 };
 
-struct dtld_dma_info {
-	__u32			length;
-	__u32			resid;
-	__u32			cur_sge;
-	__u32			num_sge;
-	__u32			sge_offset;
-	__u32			reserved;
-	union {
-		__DECLARE_FLEX_ARRAY(__u8, inline_data);
-		__DECLARE_FLEX_ARRAY(struct dtld_sge, sge);
-	};
-};
-
 struct dtld_send_wqe {
-	struct dtld_send_wr	wr;
-	__u32			status;
-	__u32			state;
-	__aligned_u64		iova;
-	__u32			mask;
-	__u32			first_psn;
-	__u32			last_psn;
-	__u32			ack_length;
-	__u32			ssn;
-	__u32			has_rd_atomic;
-	struct dtld_dma_info	dma;
+	
 };
 
 struct dtld_recv_wqe {
 	__aligned_u64		wr_id;
 	__u32			num_sge;
 	__u32			padding;
-	struct dtld_dma_info	dma;
 };
 
 struct dtld_create_ah_resp {
@@ -187,7 +110,6 @@ struct dtld_uresp_create_cq {
 };
 
 struct dtld_resize_cq_resp {
-	struct mminfo mi;
 };
 
 struct dtld_ureq_create_qp {
@@ -201,34 +123,12 @@ struct dtld_uresp_create_qp {
 };
 
 struct dtld_create_srq_resp {
-	struct mminfo mi;
 	__u32 srq_num;
 	__u32 reserved;
 };
 
 struct dtld_modify_srq_cmd {
 	__aligned_u64 mmap_info_addr;
-};
-
-/* This data structure is stored at the base of work and
- * completion queues shared between user space and kernel space.
- * It contains the producer and consumer indices. Is also
- * contains a copy of the queue size parameters for user space
- * to use but the kernel must use the parameters in the
- * dtld_queue struct. For performance reasons arrange to have
- * producer and consumer indices in separate cache lines
- * the kernel should always mask the indices to avoid accessing
- * memory outside of the data area
- */
-struct dtld_queue_buf {
-	__u32			log2_elem_size;
-	__u32			index_mask;
-	__u32			pad_1[30];
-	__u32			producer_index;
-	__u32			pad_2[31];
-	__u32			consumer_index;
-	__u32			pad_3[31];
-	__u8			data[];
 };
 
 #endif /* RDMA_USER_DTLD_H */
