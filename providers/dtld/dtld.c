@@ -162,13 +162,6 @@ static struct ibv_cq *dtld_create_cq(struct ibv_context *context, int cqe,
 		free(cq);
 		return NULL;
 	}
-	//
-	// cq->wc_size = 1ULL << cq->queue->log2_elem_size;
-	//
-	// if (cq->wc_size < sizeof(struct ib_uverbs_wc)) {
-	// 	dtld_destroy_cq(&cq->vcq.cq);
-	// 	return NULL;
-	// }
 
 	struct mminfo sq_mi = {
 		.size = resp.q_length,
@@ -191,8 +184,8 @@ static int dtld_destroy_cq(struct ibv_cq *ibcq)
 	if (ret)
 		return ret;
 
-	// if (cq->mmap_info.size)    // TODO delete me
-	// 	munmap(cq->queue, cq->mmap_info.size);   //TODO deletel me
+	if (cq->mmap_info.size)   
+		munmap(cq->queue, cq->mmap_info.size); 
 	free(cq);
 
 	return 0;
@@ -270,7 +263,6 @@ static struct ibv_qp *dtld_create_qp(struct ibv_pd *ibpd,
 	if (ret)
 		goto err_destroy;
 
-	// qp->sq_mmap_info = resp.sq_mi;
 	pthread_spin_init(&qp->sq.lock, PTHREAD_PROCESS_PRIVATE);
 	
 	return &qp->vqp.qp;
@@ -428,7 +420,10 @@ static int post_one_send(struct dtld_qp *qp, struct dtld_wq *sq,
 	for (i = 0; i < ibwr->num_sge; i++)
 		length += ibwr->sg_list[i].length;
 
+	// TODO: call validate_send_wr() to check 
+	
 	// TODO: communicate with real hardware.
+
 
 	return 0;
 }
@@ -463,7 +458,7 @@ static int dtld_post_send(struct ibv_qp *ibqp,
 	// if (!sq || !wr_list || !sq->queue)
 	// 	return EINVAL;
 
-	// pthread_spin_lock(&sq->lock);
+	pthread_spin_lock(&sq->lock);
 
 	while (wr_list) {
 		rc = post_one_send(qp, sq, wr_list);
@@ -478,7 +473,7 @@ static int dtld_post_send(struct ibv_qp *ibqp,
 		wr_list = wr_list->next;
 	}
 
-	// pthread_spin_unlock(&sq->lock);
+	pthread_spin_unlock(&sq->lock);
 
 	err =  post_send_db(ibqp);
 	return err ? err : rc;
