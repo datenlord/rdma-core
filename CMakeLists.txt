@@ -733,6 +733,8 @@ add_subdirectory(providers/rxe)
 add_subdirectory(providers/rxe/man)
 add_subdirectory(providers/siw)
 
+add_subdirectory(providers/dtld)
+
 add_subdirectory(libibmad)
 add_subdirectory(libibnetdisc)
 add_subdirectory(libibnetdisc/man)
